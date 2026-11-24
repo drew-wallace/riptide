@@ -11,6 +11,7 @@ mod time_util;
 mod ui;
 mod webview;
 mod win_icon;
+mod win_video;
 
 use std::sync::Arc;
 

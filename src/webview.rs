@@ -17,16 +17,17 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wry::{WebContext, WebView, WebViewBuilder};
 
 #[cfg(target_os = "windows")]
-use tao::platform::windows::EventLoopBuilderExtWindows;
+use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
 #[cfg(target_os = "windows")]
 use wry::WebViewBuilderExtWindows;
 
 use crate::deezer;
 use crate::protocol::{
     BridgeState, FeedArtist, FeedArtistSource, FeedCollectorPayload, FeedRelease, Route,
-    WebCommand, WebEvent,
+    VideoEmbedMode, VideoUiAction, WebCommand, WebEvent,
 };
 use crate::settings::FeedCache;
+use crate::win_video;
 
 #[derive(Debug, Clone, Serialize)]
 struct YtProbeTarget {
@@ -222,6 +223,24 @@ fn run_webview_thread(
         .with_initialization_script(BRIDGE_JS)
         .with_ipc_handler(move |request| {
             let body = request.body();
+            if body.starts_with("{\"__video_action\":") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+                    && let Some(act) = v.get("__video_action").and_then(|s| s.as_str())
+                {
+                    let action = match act {
+                        "enter_pip" => Some(VideoUiAction::EnterPip),
+                        "exit_pip" => Some(VideoUiAction::ExitPipToNormal),
+                        "close_pip" => Some(VideoUiAction::ClosePip),
+                        "toggle_fullscreen" => Some(VideoUiAction::ToggleFullscreen),
+                        "exit_fullscreen" => Some(VideoUiAction::ExitFullscreen),
+                        _ => None,
+                    };
+                    if let Some(a) = action {
+                        let _ = ipc_tx.send(WebEvent::VideoAction(a));
+                    }
+                }
+                return;
+            }
             match serde_json::from_str::<BridgeState>(body) {
                 Ok(state) => {
                     if auto_hide_for_ipc.load(Ordering::Relaxed) == AUTO_HIDE_AFTER_SIGN_IN
@@ -275,6 +294,7 @@ fn run_webview_thread(
     let feed_run_counter = Arc::new(AtomicU64::new(1));
     let loop_proxy = event_loop.create_proxy();
     let mut pending_feed_dates: Option<PendingFeedDates> = None;
+    let mut video_embed_mode: Option<VideoEmbedMode> = None;
 
     let _ = proxy_tx.send(Ok(proxy));
     let _ = event_tx.send(WebEvent::StatusMessage(
@@ -291,6 +311,9 @@ fn run_webview_thread(
                 ..
             } => {
                 if window_id == window.id() {
+                    if video_embed_mode.take().is_some() {
+                        eval_js(&webview, "window.__ytmMask?.setVideoEmbedMode('off');");
+                    }
                     window.set_visible(false);
                     visible_flag.store(false, Ordering::Relaxed);
                     auto_hide_mode.store(AUTO_HIDE_NONE, Ordering::Relaxed);
@@ -301,9 +324,74 @@ fn run_webview_thread(
                 WebCommand::Shutdown => {
                     *control_flow = ControlFlow::Exit;
                 }
+                WebCommand::SyncVideoViewport(vp_opt) => {
+                    // Never hijack the window while the user has the Sign-In / Inspector window open
+                    if visible_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    #[cfg(target_os = "windows")]
+                    let wv_hwnd = window.hwnd() as isize;
+                    #[cfg(not(target_os = "windows"))]
+                    let wv_hwnd = 0isize;
+
+                    match vp_opt {
+                        Some(vp) => {
+                            win_video::sync_webview_video_window(
+                                wv_hwnd,
+                                "Riptide",
+                                Some(vp.rect),
+                            );
+                            let _ = webview.set_visible(true);
+                            let _ = webview.set_bounds(wry::Rect {
+                                position: wry::dpi::Position::Physical(
+                                    wry::dpi::PhysicalPosition::new(0, 0),
+                                ),
+                                size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
+                                    vp.rect.w.max(1) as u32,
+                                    vp.rect.h.max(1) as u32,
+                                )),
+                            });
+                            if video_embed_mode != Some(vp.mode) {
+                                video_embed_mode = Some(vp.mode);
+                                eval_js(
+                                    &webview,
+                                    &format!(
+                                        "window.__ytmMask?.setVideoEmbedMode({});",
+                                        js_str(vp.mode.as_slug())
+                                    ),
+                                );
+                            } else {
+                                eval_js(&webview, "window.__ytmMask?.syncVideoSize?.();");
+                            }
+                        }
+                        None => {
+                            if video_embed_mode.take().is_some() {
+                                win_video::sync_webview_video_window(wv_hwnd, "Riptide", None);
+                                eval_js(&webview, "window.__ytmMask?.setVideoEmbedMode('off');");
+                            }
+                        }
+                    }
+                }
                 WebCommand::SetWebViewVisible(show) => {
+                    if video_embed_mode.take().is_some() {
+                        #[cfg(target_os = "windows")]
+                        win_video::sync_webview_video_window(window.hwnd() as isize, "Riptide", None);
+                        eval_js(&webview, "window.__ytmMask?.setVideoEmbedMode('off');");
+                        window.set_inner_size(LogicalSize::new(1280.0, 840.0));
+                    }
                     window.set_visible(show);
                     if show {
+                        let sz = window.inner_size();
+                        let _ = webview.set_visible(true);
+                        let _ = webview.set_bounds(wry::Rect {
+                            position: wry::dpi::Position::Physical(
+                                wry::dpi::PhysicalPosition::new(0, 0),
+                            ),
+                            size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
+                                sz.width.max(1),
+                                sz.height.max(1),
+                            )),
+                        });
                         window.set_focus();
                     }
                     visible_flag.store(show, Ordering::Relaxed);
@@ -314,8 +402,25 @@ fn run_webview_thread(
                 }
                 WebCommand::ToggleWebViewVisible => {
                     let next = !visible_flag.load(Ordering::Relaxed);
+                    if video_embed_mode.take().is_some() {
+                        #[cfg(target_os = "windows")]
+                        win_video::sync_webview_video_window(window.hwnd() as isize, "Riptide", None);
+                        eval_js(&webview, "window.__ytmMask?.setVideoEmbedMode('off');");
+                        window.set_inner_size(LogicalSize::new(1280.0, 840.0));
+                    }
                     window.set_visible(next);
                     if next {
+                        let sz = window.inner_size();
+                        let _ = webview.set_visible(true);
+                        let _ = webview.set_bounds(wry::Rect {
+                            position: wry::dpi::Position::Physical(
+                                wry::dpi::PhysicalPosition::new(0, 0),
+                            ),
+                            size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
+                                sz.width.max(1),
+                                sz.height.max(1),
+                            )),
+                        });
                         window.set_focus();
                     }
                     visible_flag.store(next, Ordering::Relaxed);
@@ -323,8 +428,25 @@ fn run_webview_thread(
                     let _ = event_tx.send(WebEvent::WebViewVisibilityChanged(next));
                 }
                 WebCommand::OpenSignIn => {
+                    if video_embed_mode.take().is_some() {
+                        #[cfg(target_os = "windows")]
+                        win_video::sync_webview_video_window(window.hwnd() as isize, "Riptide", None);
+                        eval_js(&webview, "window.__ytmMask?.setVideoEmbedMode('off');");
+                        window.set_inner_size(LogicalSize::new(1280.0, 840.0));
+                    }
                     auto_hide_mode.store(AUTO_HIDE_AFTER_SIGN_IN, Ordering::Relaxed);
                     window.set_visible(true);
+                    let sz = window.inner_size();
+                    let _ = webview.set_visible(true);
+                    let _ = webview.set_bounds(wry::Rect {
+                        position: wry::dpi::Position::Physical(
+                            wry::dpi::PhysicalPosition::new(0, 0),
+                        ),
+                        size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
+                            sz.width.max(1),
+                            sz.height.max(1),
+                        )),
+                    });
                     window.set_focus();
                     visible_flag.store(true, Ordering::Relaxed);
                     let _ = event_tx.send(WebEvent::WebViewVisibilityChanged(true));
@@ -459,6 +581,13 @@ fn dispatch_js_command(webview: &WebView, cmd: WebCommand) {
         WebCommand::ToggleDislike => "window.__ytmMask?.toggleDislike();".to_string(),
         WebCommand::ToggleShuffle => "window.__ytmMask?.toggleShuffle();".to_string(),
         WebCommand::CycleRepeat => "window.__ytmMask?.cycleRepeat();".to_string(),
+        WebCommand::SetPlaybackMode(mode) => {
+            let slug = match mode {
+                crate::protocol::PlaybackMode::Song => "song",
+                crate::protocol::PlaybackMode::Video => "video",
+            };
+            format!("window.__ytmMask?.setPlaybackMode({:?});", slug)
+        }
         WebCommand::NavigateRoute(route) => {
             format!("window.__ytmMask?.navigateRoute({});", js_str(route_slug(route)))
         }
@@ -510,14 +639,35 @@ fn dispatch_js_command(webview: &WebView, cmd: WebCommand) {
             js_str(&description),
             js_str(&privacy)
         ),
+        WebCommand::SavePlaylistForm {
+            title,
+            description,
+            privacy,
+        } => format!(
+            "window.__ytmMask?.savePlaylistForm({}, {}, {});",
+            js_str(&title),
+            js_str(&description),
+            js_str(&privacy)
+        ),
+        WebCommand::SyncVideoViewport(_) => return,
         WebCommand::GoBack => "window.__ytmMask?.goBack();".to_string(),
         WebCommand::GoForward => "window.__ytmMask?.goForward();".to_string(),
         WebCommand::Refresh => "window.__ytmMask?.refresh();".to_string(),
         WebCommand::ScrollMore => "window.__ytmMask?.scrollMore();".to_string(),
         WebCommand::RequestQueue => "window.__ytmMask?.requestQueue();".to_string(),
+        WebCommand::PlayQueueItem(idx) => format!("window.__ytmMask?.playQueueItem({idx});"),
+        WebCommand::MoveQueueItem { from, to } => {
+            format!("window.__ytmMask?.moveQueueItem({from}, {to});")
+        }
         WebCommand::RequestLyrics => "window.__ytmMask?.requestLyrics();".to_string(),
         WebCommand::RequestRelated => "window.__ytmMask?.requestRelated();".to_string(),
-        WebCommand::ClosePlayerPage => "window.__ytmMask?.closePlayerPage();".to_string(),
+        WebCommand::ClosePlayerPage(fallback_url) => {
+            let url_js = fallback_url
+                .as_deref()
+                .map(js_str)
+                .unwrap_or_else(|| "null".to_string());
+            format!("window.__ytmMask?.closePlayerPage({url_js});")
+        }
         WebCommand::RefreshFeed(_)
         | WebCommand::CollectorIpc(_)
         | WebCommand::DeezerFeedFinished { .. }

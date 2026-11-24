@@ -25,6 +25,18 @@
   let lastTrackedUrl = window.location.href;
   let lastUrlChangedAt = Date.now();
   let playlistHydrationToken = 0;
+  const bridgeSessionId =
+    Math.random().toString(36).slice(2, 10) + "-" + Date.now().toString(36);
+
+  // Pre-seed desired volume from localStorage so even a full page reload never blasts at 100%
+  try {
+    const savedVol = Number(localStorage.getItem("__riptide_vol"));
+    const savedMuted = localStorage.getItem("__riptide_muted") === "1";
+    if (Number.isFinite(savedVol) && savedVol >= 0 && savedVol <= 100) {
+      window.__ytmDesiredVolume = Math.round(savedVol);
+      window.__ytmDesiredMuted = savedMuted || savedVol === 0;
+    }
+  } catch (_) {}
 
   function registerAction(el) {
     if (!el) return "";
@@ -317,9 +329,30 @@
     return links;
   }
 
+  function isWatchUrl(url) {
+    if (!url || typeof url !== "string") return false;
+    const p = cleanHrefPath(url).toLowerCase();
+    return p === "watch" || p.startsWith("watch?") || p.startsWith("watch/");
+  }
+
+  function urlsMatchLoosely(a, b) {
+    const norm = s => String(s || "").trim().replace(/\/+$/, "").toLowerCase();
+    return norm(a) === norm(b);
+  }
+
+  function isNavProgressActive() {
+    const progressEl = document.querySelector("yt-page-navigation-progress");
+    if (!progressEl || isHiddenEl(progressEl)) return false;
+    const val = Number(progressEl.getAttribute("aria-valuenow") || 0);
+    return val > 0 && val < 100;
+  }
+
   function spaNavigateEndpoint(endpoint, fallbackUrl) {
     const app = document.querySelector("ytmusic-app");
     const prevUrl = window.location.href;
+    if (fallbackUrl && urlsMatchLoosely(prevUrl, fallbackUrl)) {
+      return;
+    }
     if (app && endpoint) {
       try {
         app.dispatchEvent(
@@ -331,12 +364,19 @@
         );
       } catch (_) {}
     }
-    if (fallbackUrl) {
+    // Never hard-reload onto a /watch URL (which destroys playback & volume), and give SPA
+    // navigation plenty of time before falling back to a full page load.
+    if (fallbackUrl && !isWatchUrl(fallbackUrl)) {
+      const delay = endpoint ? 1400 : 250;
       setTimeout(() => {
-        if (window.location.href === prevUrl) {
+        if (
+          window.location.href === prevUrl &&
+          !urlsMatchLoosely(window.location.href, fallbackUrl) &&
+          !isNavProgressActive()
+        ) {
           window.location.href = fallbackUrl;
         }
-      }, 480);
+      }, delay);
     }
   }
 
@@ -363,6 +403,9 @@
     if (path.startsWith("library/artists")) {
       return { browseEndpoint: { browseId: "FEmusic_library_corpus_track_artists" } };
     }
+    if (path.startsWith("library/subscriptions")) {
+      return { browseEndpoint: { browseId: "FEmusic_library_corpus_artists" } };
+    }
     if (path.startsWith("playlist?")) {
       try {
         const params = new URLSearchParams(path.split("?")[1] || "");
@@ -386,6 +429,18 @@
         const params = new URLSearchParams(path.split("?")[1] || "");
         const q = params.get("q");
         if (q) return { searchEndpoint: { query: q } };
+      } catch (_) {}
+    }
+    if (path.startsWith("watch?")) {
+      try {
+        const params = new URLSearchParams(path.split("?")[1] || "");
+        const videoId = params.get("v");
+        const playlistId = params.get("list");
+        if (videoId) {
+          const watchEndpoint = { videoId };
+          if (playlistId) watchEndpoint.playlistId = playlistId;
+          return { watchEndpoint };
+        }
       } catch (_) {}
     }
     return null;
@@ -425,7 +480,11 @@
 
   function isPlayerPageOpen() {
     const page = document.querySelector("ytmusic-player-page");
-    return !!(page && page.hasAttribute("player-page-open_"));
+    if (page && (page.hasAttribute("player-page-open_") || page.hasAttribute("player-page-open"))) {
+      return true;
+    }
+    const layout = document.querySelector("ytmusic-app-layout");
+    return !!(layout && layout.hasAttribute("player-page-open"));
   }
 
   function getActiveBrowseRoot(route) {
@@ -627,6 +686,27 @@
       }
     }
 
+    let playbackMode = "song";
+    let canToggleVideo = false;
+    const inVideoEmbed = !!(document.body && document.body.classList.contains("ytm-video-embed-mode"));
+    const avToggle = document.querySelector("ytmusic-av-toggle");
+    if (avToggle && (inVideoEmbed || !avToggle.hasAttribute("hidden"))) {
+      const disabled =
+        avToggle.hasAttribute("toggle-disabled") ||
+        avToggle.getAttribute("aria-disabled") === "true";
+      canToggleVideo = !disabled;
+      const modeAttr = (avToggle.getAttribute("playback-mode") || "").toUpperCase();
+      const videoBtn = avToggle.querySelector(".video-button");
+      if (
+        modeAttr.includes("OMV") ||
+        modeAttr.includes("VIDEO") ||
+        avToggle.hasAttribute("video-mode") ||
+        (videoBtn && videoBtn.getAttribute("aria-pressed") === "true")
+      ) {
+        playbackMode = "video";
+      }
+    }
+
     const hasMedia = !!(title || duration > 0);
 
     return {
@@ -644,6 +724,8 @@
       like_status: likeStatus,
       repeat_mode: repeatMode,
       is_shuffled: isShuffled,
+      playback_mode: playbackMode,
+      can_toggle_video: canToggleVideo,
     };
   }
 
@@ -746,12 +828,20 @@
         const btn = node.querySelector("button, a") || node;
         const txt = cleanText(btn) || btn.getAttribute("aria-label") || "";
         const lower = txt.toLowerCase();
-        if (!txt || lower === "more" || lower === "less" || lower.includes("read more")) continue;
-        if (lower.includes("play") || lower === "shuffle") {
+        if (
+          !txt ||
+          lower === "more" ||
+          lower === "less" ||
+          lower.includes("read more") ||
+          lower.includes("thumbnail")
+        ) {
+          continue;
+        }
+        if (lower.includes("edit") || lower.includes("save") || lower.includes("share")) {
+          pushAction(btn, txt, "secondary", false);
+        } else if (lower.includes("play") || lower === "shuffle") {
           pushAction(btn, txt, actions.length === 0 ? "primary" : "secondary", false);
         } else if (lower.includes("radio") || lower.includes("mix")) {
-          pushAction(btn, txt, "secondary", false);
-        } else if (lower.includes("edit") || lower.includes("save") || lower.includes("share")) {
           pushAction(btn, txt, "secondary", false);
         }
         continue;
@@ -767,8 +857,13 @@
         }
         const raw = (node.getAttribute("aria-label") || "") + " " + cleanText(node);
         const lower = raw.toLowerCase();
+        if (lower.includes("thumbnail")) continue;
         if (lower.includes("action menu") || lower.includes("more actions")) {
           pushAction(node, "More", "menu", false);
+        } else if (lower.includes("edit")) {
+          pushAction(node, cleanText(node) || "Edit playlist", "secondary", false);
+        } else if (lower.includes("share")) {
+          pushAction(node, cleanText(node) || "Share", "secondary", false);
         } else if (lower.includes("shuffle")) {
           pushAction(node, "Shuffle", actions.length === 0 ? "primary" : "secondary", false);
         } else if (lower.includes("radio") || lower.includes("mix")) {
@@ -1369,64 +1464,109 @@
   }
 
   /**
-   * Captures YouTube Music's Share modal (`yt-unified-share-panel-renderer` / `yt-copy-link-renderer`)
-   * so GPUI can render a native TIDAL-styled Share popup with one-click Copy Link and share targets.
+   * Captures YouTube Music's Share modal (`yt-unified-share-panel-renderer`, `yt-copy-link-renderer`,
+   * or playlist share dialogs inside `tp-yt-paper-dialog` / `ytmusic-dialog`) so GPUI can render
+   * a native TIDAL-styled Share popup with one-click Copy Link and share targets.
    */
   function extractShareDialog() {
-    const panels = Array.from(
+    let panels = Array.from(
       document.querySelectorAll("yt-unified-share-panel-renderer, yt-copy-link-renderer")
     ).filter(p => !isHiddenEl(p));
+
+    if (panels.length === 0) {
+      // Also check open dialogs whose heading mentions "Share" or that contain a share URL input
+      const openDialogs = Array.from(
+        document.querySelectorAll("tp-yt-paper-dialog, ytmusic-dialog")
+      ).filter(d => {
+        if (isHiddenEl(d)) return false;
+        if (d.tagName.toLowerCase() === "tp-yt-paper-dialog" && d.opened === false) return false;
+        const txt = cleanText(d.querySelector("#title, h2, .title")).toLowerCase();
+        return (
+          txt.includes("share") ||
+          !!d.querySelector("input#share-url, yt-copy-link-renderer, yt-share-target-renderer")
+        );
+      });
+      if (openDialogs.length > 0) {
+        panels = [openDialogs[openDialogs.length - 1]];
+      }
+    }
+
     if (panels.length === 0) return null;
 
     const panel =
       panels.find(p => p.tagName.toLowerCase() === "yt-unified-share-panel-renderer") ||
       panels[panels.length - 1];
 
-    // Check if the enclosing dialog is actually visible/opened
     const paperDialog = panel.closest && panel.closest("tp-yt-paper-dialog");
-    if (paperDialog && !paperDialog.opened && paperDialog.getAttribute("aria-hidden") === "true") {
+    if (paperDialog && paperDialog.opened === false) {
       return null;
     }
 
     let url = "";
-    const urlInput = panel.querySelector(
-      "input#share-url, yt-copy-link-renderer input, input[readonly], input[type='text']"
-    );
-    if (urlInput && typeof urlInput.value === "string" && urlInput.value.trim()) {
-      url = urlInput.value.trim();
+    const inputs = panel.querySelectorAll("input");
+    for (const inp of inputs) {
+      const val = typeof inp.value === "string" ? inp.value.trim() : "";
+      if (val.startsWith("http://") || val.startsWith("https://")) {
+        url = val;
+        break;
+      }
     }
+
     if (!url) {
       const copyEl =
         panel.tagName.toLowerCase() === "yt-copy-link-renderer"
           ? panel
           : panel.querySelector("yt-copy-link-renderer");
       const copyData = copyEl && (copyEl.data || (copyEl.__data && copyEl.__data.data));
-      if (copyData && typeof copyData.shortUrl === "string") {
+      if (copyData && typeof copyData.shortUrl === "string" && copyData.shortUrl.startsWith("http")) {
         url = copyData.shortUrl.trim();
       }
     }
+
     if (!url) {
-      const pData = panel.data || (panel.__data && panel.__data.data);
-      const findUrl = (obj, depth = 0) => {
-        if (!obj || typeof obj !== "object" || depth > 5) return "";
-        if (typeof obj.shortUrl === "string" && obj.shortUrl.startsWith("http")) return obj.shortUrl;
-        for (const k of Object.keys(obj)) {
-          if (k === "shortUrl" || k === "copyLinkRenderer" || k === "contents" || k === "bar") {
-            const v = obj[k];
-            if (Array.isArray(v)) {
-              for (const item of v) {
-                const f = findUrl(item, depth + 1);
-                if (f) return f;
-              }
-            } else {
-              const f = findUrl(v, depth + 1);
-              if (f) return f;
+      // Bounded BFS over Polymer `.data` to find `shortUrl` or any YouTube share URL
+      const roots = [
+        panel.data,
+        panel.__data && panel.__data.data,
+        panel.__data,
+        paperDialog && paperDialog.data,
+      ].filter(Boolean);
+      const visited = new Set();
+      const queue = [...roots];
+      let nodes = 0;
+      while (queue.length > 0 && nodes < 500 && !url) {
+        const cur = queue.shift();
+        if (!cur || typeof cur !== "object" || visited.has(cur)) continue;
+        if (typeof Node !== "undefined" && cur instanceof Node) continue;
+        visited.add(cur);
+        nodes++;
+        if (typeof cur.shortUrl === "string" && cur.shortUrl.startsWith("http")) {
+          url = cur.shortUrl.trim();
+          break;
+        }
+        if (Array.isArray(cur)) {
+          for (const item of cur.slice(0, 12)) {
+            if (item && typeof item === "object") queue.push(item);
+          }
+        } else {
+          for (const k of Object.keys(cur)) {
+            if (k === "trackingParams" || k === "thumbnails" || k.startsWith("__")) continue;
+            const v = cur[k];
+            if (
+              typeof v === "string" &&
+              (v.startsWith("https://music.youtube.com/") || v.startsWith("https://youtu.be/"))
+            ) {
+              url = v.trim();
+              break;
             }
+            if (v && typeof v === "object") queue.push(v);
           }
         }
-        return "";
-      };
-      url = findUrl(pData);
+      }
+    }
+
+    if (!url && window.location.pathname.startsWith("/playlist")) {
+      url = window.location.href;
     }
 
     if (!url) return null;
@@ -1482,6 +1622,62 @@
     };
   }
 
+  let headlessCreateInFlight = false;
+
+  /**
+   * Captures YouTube Music's Edit Playlist modal (`ytmusic-playlist-form`) so GPUI can render
+   * a native TIDAL-styled Edit Playlist modal and save edits back into the real webapp form.
+   */
+  function extractPlaylistFormDialog() {
+    if (headlessCreateInFlight) return null;
+    const forms = Array.from(document.querySelectorAll("ytmusic-playlist-form")).filter(f => {
+      if (isHiddenEl(f)) return false;
+      const dlg = f.closest && f.closest("tp-yt-paper-dialog");
+      if (dlg && dlg.opened === false) return false;
+      return true;
+    });
+    if (forms.length === 0) return null;
+
+    const form = forms[forms.length - 1];
+    const titleInput =
+      form.querySelector("#title-input input") ||
+      form.querySelector("tp-yt-paper-input input") ||
+      form.querySelector("input");
+    const descInput =
+      form.querySelector("#description-input textarea") ||
+      form.querySelector("tp-yt-paper-textarea textarea") ||
+      form.querySelector("textarea");
+
+    const heading =
+      cleanText(form.querySelector("h2, .header, .title, yt-formatted-string.title")) ||
+      "Edit Playlist";
+
+    let privacy = "private";
+    const dropTxt = cleanText(form.querySelector("ytmusic-dropdown-renderer")).toLowerCase();
+    if (dropTxt.includes("public")) privacy = "public";
+    else if (dropTxt.includes("unlisted")) privacy = "unlisted";
+    else if (dropTxt.includes("private")) privacy = "private";
+
+    let submitLabel = "Save";
+    const btns = form.querySelectorAll("yt-button-renderer button, button");
+    for (const btn of btns) {
+      const txt = cleanText(btn);
+      const lower = txt.toLowerCase();
+      if (lower === "save" || lower === "create") {
+        submitLabel = txt;
+        break;
+      }
+    }
+
+    return {
+      heading,
+      title: titleInput && typeof titleInput.value === "string" ? titleInput.value : "",
+      description: descInput && typeof descInput.value === "string" ? descInput.value : "",
+      privacy,
+      submit_label: submitLabel,
+    };
+  }
+
   function detectModalOpen() {
     const dialogs = document.querySelectorAll(
       "tp-yt-paper-dialog, ytmusic-dialog, ytmusic-playlist-form"
@@ -1521,10 +1717,58 @@
     return out;
   }
 
+  function getActiveQueueContainer() {
+    const page = document.querySelector("ytmusic-player-page");
+    const candidates = Array.from((page || document).querySelectorAll("ytmusic-player-queue"));
+    return candidates.find(q => !isHiddenEl(q)) || candidates[0] || null;
+  }
+
+  /**
+   * Returns only the single active list of visible queue items, deduplicating hidden
+   * Song/Video counterparts inside `ytmusic-playlist-panel-video-wrapper-renderer` so
+   * "Play next" entries are never double-counted.
+   */
+  function getVisibleQueueItems() {
+    const queue = getActiveQueueContainer();
+    if (!queue) return [];
+    const contents = queue.querySelector("#contents");
+    if (!contents) return [];
+
+    const out = [];
+    const seenWrappers = new Set();
+    const raw = contents.querySelectorAll("ytmusic-player-queue-item");
+    for (const el of raw) {
+      if (el.hasAttribute("hidden")) continue;
+      if (el.style && (el.style.display === "none" || el.style.visibility === "hidden")) continue;
+
+      const wrapper = el.closest && el.closest("ytmusic-playlist-panel-video-wrapper-renderer");
+      if (wrapper) {
+        if (wrapper.hasAttribute("hidden") || seenWrappers.has(wrapper)) continue;
+        // Skip hidden counterpart slot inside a Song/Video wrapper
+        const counterpart = el.closest("#counterpart, [slot='counterpart']");
+        if (counterpart) continue;
+        try {
+          const cs = window.getComputedStyle(el);
+          if (cs && (cs.display === "none" || cs.visibility === "hidden")) continue;
+        } catch (_) {}
+        seenWrappers.add(wrapper);
+      } else {
+        try {
+          const cs = window.getComputedStyle(el);
+          if (cs && (cs.display === "none" || cs.visibility === "hidden")) continue;
+        } catch (_) {}
+      }
+
+      out.push(el);
+      if (out.length >= 60) break;
+    }
+    return out;
+  }
+
   function extractQueue() {
     const out = [];
-    const items = document.querySelectorAll("ytmusic-player-queue #contents ytmusic-player-queue-item");
-    for (const el of Array.from(items).slice(0, 50)) {
+    const items = getVisibleQueueItems();
+    for (const el of items) {
       const title = cleanText(el.querySelector(".song-title"));
       if (!title) continue;
       const bylineEl = el.querySelector(".byline");
@@ -1536,8 +1780,10 @@
         el.hasAttribute("selected") || el.getAttribute("play-button-state") === "playing";
       const playTarget =
         el.querySelector("ytmusic-play-button-renderer, .play-button, .left-items") || el;
+      const menuBtn = findMenuButton(el);
       out.push({
         id: registerAction(playTarget),
+        menu_id: menuBtn ? registerAction(menuBtn) : null,
         title,
         artist,
         artist_links: artistLinks,
@@ -1614,6 +1860,7 @@
 
     return {
       connected: window.location.hostname === "music.youtube.com",
+      bridge_session_id: bridgeSessionId,
       url,
       page_title: document.title || "YouTube Music",
       route,
@@ -1627,6 +1874,7 @@
       empty_state: emptyState,
       confirm_dialog: extractConfirmDialog(),
       share_dialog: extractShareDialog(),
+      playlist_form: extractPlaylistFormDialog(),
       account: extractAccount(),
       player: extractPlayer(),
       chips: extractChips(root),
@@ -1685,12 +1933,33 @@
     return false;
   }
 
+  function hasVisibleBrowseContent() {
+    const route = inferRoute(window.location.href);
+    const root = getActiveBrowseRoot(route);
+    if (!root) return false;
+    return !!(
+      root.querySelector(
+        "ytmusic-shelf-renderer, ytmusic-carousel-shelf-renderer, ytmusic-grid-renderer, ytmusic-playlist-shelf-renderer, ytmusic-responsive-header-renderer, ytmusic-detail-header-renderer, ytmusic-immersive-header-renderer, ytmusic-card-shelf-renderer, ytmusic-music-card-shelf-renderer"
+      )
+    );
+  }
+
   function closePlayerOverlayIfOpen() {
-    const page = document.querySelector("ytmusic-player-page");
-    if (page && page.hasAttribute("player-page-open_")) {
-      const toggle = document.querySelector("ytmusic-player-bar .toggle-player-page-button");
-      if (toggle) clickEl(toggle);
+    if (!isPlayerPageOpen()) return false;
+    const toggle =
+      document.querySelector("ytmusic-player-bar .toggle-player-page-button button") ||
+      document.querySelector("ytmusic-player-bar .toggle-player-page-button");
+    if (toggle && clickEl(toggle)) {
+      return true;
     }
+    const app = document.querySelector("ytmusic-app");
+    if (app && typeof app.closePlayerPage_ === "function") {
+      try {
+        app.closePlayerPage_();
+        return true;
+      } catch (_) {}
+    }
+    return false;
   }
 
   function openPlayerTab(keyword) {
@@ -1708,8 +1977,10 @@
       return false;
     };
 
-    if (!page.hasAttribute("player-page-open_")) {
-      const toggle = document.querySelector("ytmusic-player-bar .toggle-player-page-button");
+    if (!isPlayerPageOpen()) {
+      const toggle =
+        document.querySelector("ytmusic-player-bar .toggle-player-page-button button") ||
+        document.querySelector("ytmusic-player-bar .toggle-player-page-button");
       if (toggle) clickEl(toggle);
       setTimeout(() => {
         selectTab();
@@ -1820,6 +2091,10 @@
       const v = Math.max(0, Math.min(100, Math.round(Number(vol) || 0)));
       window.__ytmDesiredVolume = v;
       window.__ytmDesiredMuted = v === 0;
+      try {
+        localStorage.setItem("__riptide_vol", String(v));
+        localStorage.setItem("__riptide_muted", v === 0 ? "1" : "0");
+      } catch (_) {}
       applyVolumeToPlayer(v, v === 0);
       scheduleSync(80);
     },
@@ -1832,7 +2107,12 @@
       }
       setTimeout(() => {
         const video = document.querySelector("video.html5-main-video") || document.querySelector("video");
-        if (video) window.__ytmDesiredMuted = !!video.muted;
+        if (video) {
+          window.__ytmDesiredMuted = !!video.muted;
+          try {
+            localStorage.setItem("__riptide_muted", video.muted ? "1" : "0");
+          } catch (_) {}
+        }
         sendState(true);
       }, 90);
     },
@@ -1859,6 +2139,19 @@
       const btn = document.querySelector("ytmusic-player-bar .repeat button, ytmusic-player-bar .repeat");
       if (btn) clickEl(btn);
       scheduleSync(150);
+    },
+    setPlaybackMode(mode) {
+      const wantVideo = String(mode || "").toLowerCase() === "video";
+      const avToggle = document.querySelector("ytmusic-av-toggle");
+      if (!avToggle || avToggle.hasAttribute("toggle-disabled")) return;
+      const target = wantVideo
+        ? avToggle.querySelector(".video-button, [aria-label*='Video']")
+        : avToggle.querySelector(".song-button, [aria-label*='Song']");
+      if (target) {
+        clickEl(target);
+        scheduleSync(200);
+        setTimeout(() => sendState(true), 700);
+      }
     },
     navigateRoute(route) {
       closePlayerOverlayIfOpen();
@@ -1887,6 +2180,11 @@
       const full = url.startsWith("http")
         ? url
         : "https://music.youtube.com/" + url.replace(/^\/+/, "");
+      // Never navigate browse history onto a /watch URL (which would restart an old track)
+      if (isWatchUrl(full)) {
+        scheduleSync(200);
+        return;
+      }
       spaNavigateEndpoint(endpointForUrl(full), full);
       scheduleSync(350);
     },
@@ -2214,6 +2512,10 @@
     createPlaylist(title, description, privacy) {
       const trimmedTitle = (title || "").trim();
       if (!trimmedTitle) return;
+      headlessCreateInFlight = true;
+      setTimeout(() => {
+        headlessCreateInFlight = false;
+      }, 4500);
 
       const candidates = Array.from(
         document.querySelectorAll(
@@ -2240,6 +2542,7 @@
           );
         if (!form) {
           if (attempts < 25) setTimeout(tryFill, 120);
+          else headlessCreateInFlight = false;
           return;
         }
 
@@ -2290,14 +2593,443 @@
           const txt = ((btn.getAttribute("aria-label") || "") + " " + cleanText(btn)).toLowerCase();
           if (txt.includes("create")) {
             clickEl(btn);
-            setTimeout(() => sendState(true), 600);
+            setTimeout(() => {
+              headlessCreateInFlight = false;
+              sendState(true);
+            }, 600);
             setTimeout(() => sendState(true), 1600);
             return;
           }
         }
+        headlessCreateInFlight = false;
       }
 
       setTimeout(tryFill, 180);
+    },
+    savePlaylistForm(title, description, privacy) {
+      const form = Array.from(document.querySelectorAll("ytmusic-playlist-form")).find(
+        f => !isHiddenEl(f)
+      );
+      if (!form) return;
+
+      const titleInput =
+        form.querySelector("#title-input input") ||
+        form.querySelector("tp-yt-paper-input input") ||
+        form.querySelector("input");
+      const descInput =
+        form.querySelector("#description-input textarea") ||
+        form.querySelector("tp-yt-paper-textarea textarea") ||
+        form.querySelector("textarea");
+
+      if (titleInput) {
+        titleInput.focus();
+        setNativeInputValue(titleInput, (title || "").trim());
+      }
+      if (descInput) {
+        setNativeInputValue(descInput, (description || "").trim());
+      }
+
+      const submitSave = () => {
+        const btns = form.querySelectorAll("yt-button-renderer button, button");
+        for (const btn of btns) {
+          const txt = ((btn.getAttribute("aria-label") || "") + " " + cleanText(btn)).toLowerCase();
+          if (txt.includes("save") || txt.includes("create")) {
+            clickEl(btn);
+            setTimeout(() => sendState(true), 400);
+            setTimeout(() => sendState(true), 1200);
+            return;
+          }
+        }
+      };
+
+      const targetPriv = (privacy || "").toLowerCase();
+      const dropdown = form.querySelector("ytmusic-dropdown-renderer");
+      const currentDrop = cleanText(dropdown).toLowerCase();
+      if (targetPriv && dropdown && !currentDrop.includes(targetPriv)) {
+        const trigger = dropdown.querySelector("tp-yt-paper-button, button, #dropdown-trigger");
+        if (trigger) clickEl(trigger);
+        setTimeout(() => {
+          const items = document.querySelectorAll(
+            "ytmusic-dropdown-item-renderer, tp-yt-paper-item"
+          );
+          for (const item of items) {
+            if (cleanText(item).toLowerCase().startsWith(targetPriv)) {
+              clickEl(item);
+              break;
+            }
+          }
+          setTimeout(submitSave, 160);
+        }, 160);
+      } else {
+        setTimeout(submitSave, 120);
+      }
+    },
+    setVideoEmbedMode(mode) {
+      const m =
+        mode === true
+          ? "normal"
+          : mode === false || !mode || mode === "off"
+            ? "off"
+            : String(mode);
+      const enabled = m !== "off";
+
+      const postVideoAction = action => {
+        try {
+          if (window.ipc && typeof window.ipc.postMessage === "function") {
+            window.ipc.postMessage(JSON.stringify({ __video_action: action }));
+          }
+        } catch (_) {}
+      };
+
+      let styleEl = document.getElementById("ytm-mask-video-embed-css");
+      if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.id = "ytm-mask-video-embed-css";
+        styleEl.textContent = `
+          html.ytm-video-embed-mode,
+          body.ytm-video-embed-mode,
+          body.ytm-video-embed-mode ytmusic-app,
+          body.ytm-video-embed-mode ytmusic-app-layout {
+            overflow: hidden !important;
+            background: #000 !important;
+          }
+          body.ytm-video-embed-mode ytmusic-nav-bar,
+          body.ytm-video-embed-mode ytmusic-guide-renderer,
+          body.ytm-video-embed-mode ytmusic-mini-guide-renderer,
+          body.ytm-video-embed-mode tp-yt-app-drawer,
+          body.ytm-video-embed-mode #mini-guide-background,
+          body.ytm-video-embed-mode ytmusic-player-bar,
+          body.ytm-video-embed-mode #browse-page,
+          body.ytm-video-embed-mode ytmusic-player-page #side-panel,
+          body.ytm-video-embed-mode ytmusic-player-page ytmusic-av-toggle,
+          body.ytm-video-embed-mode ytmusic-player-page .av-toggle,
+          body.ytm-video-embed-mode .song-media-controls,
+          body.ytm-video-embed-mode #song-media-window {
+            opacity: 0 !important;
+            pointer-events: none !important;
+            z-index: 0 !important;
+          }
+          body.ytm-video-embed-mode ytmusic-player-page {
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            position: fixed !important;
+            inset: 0 !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            transform: none !important;
+            z-index: 2147483640 !important;
+            background: #000 !important;
+          }
+          body.ytm-video-embed-mode ytmusic-player-page #main-panel,
+          body.ytm-video-embed-mode #player,
+          body.ytm-video-embed-mode #song-video,
+          body.ytm-video-embed-mode #player-container,
+          body.ytm-video-embed-mode #movie_player {
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            max-width: none !important;
+            max-height: none !important;
+            min-width: 100vw !important;
+            min-height: 100vh !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            transform: none !important;
+            z-index: 2147483640 !important;
+            background: #000 !important;
+          }
+          body.ytm-video-embed-mode #song-image,
+          body.ytm-video-embed-mode #movie_player .ytp-chrome-bottom,
+          body.ytm-video-embed-mode #movie_player .ytp-chrome-top,
+          body.ytm-video-embed-mode #movie_player .ytp-gradient-bottom,
+          body.ytm-video-embed-mode #movie_player .ytp-gradient-top,
+          body.ytm-video-embed-mode #movie_player .ytp-bezel-text-wrapper,
+          body.ytm-video-embed-mode #movie_player .ytp-pause-overlay,
+          body.ytm-video-embed-mode #movie_player .ytp-ce-element,
+          body.ytm-video-embed-mode #movie_player .ytp-watermark,
+          body.ytm-video-embed-mode #movie_player .ytp-cued-thumbnail-overlay {
+            display: none !important;
+          }
+          body.ytm-video-embed-mode #movie_player .html5-video-container {
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+          }
+          body.ytm-video-embed-mode video.html5-main-video {
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            left: 0 !important;
+            top: 0 !important;
+            object-fit: contain !important;
+            background: #000 !important;
+          }
+          #ytm-mask-video-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 2147483647;
+            cursor: pointer;
+            user-select: none;
+            background: transparent;
+          }
+          body.ytm-video-embed-mode #ytm-mask-video-overlay {
+            display: block;
+          }
+          #ytm-mask-video-overlay .ytm-vo-bar {
+            position: absolute;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            opacity: 0;
+            transition: opacity 0.16s ease;
+            pointer-events: none;
+          }
+          #ytm-mask-video-overlay:hover .ytm-vo-bar,
+          #ytm-mask-video-overlay.vo-active .ytm-vo-bar {
+            opacity: 1;
+            pointer-events: auto;
+          }
+          #ytm-mask-video-overlay.vo-idle {
+            cursor: none;
+          }
+          #ytm-mask-video-overlay.vo-idle .ytm-vo-bar {
+            opacity: 0 !important;
+            pointer-events: none !important;
+          }
+          #ytm-mask-video-overlay .ytm-vo-top {
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            justify-content: space-between;
+          }
+          #ytm-mask-video-overlay .ytm-vo-bottom-right {
+            bottom: 12px;
+            right: 12px;
+          }
+          #ytm-mask-video-overlay .ytm-vo-btn {
+            width: 34px;
+            height: 34px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            background: rgba(12, 12, 14, 0.72);
+            color: #fff;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            padding: 0;
+            backdrop-filter: blur(8px);
+            transition: background 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
+          }
+          #ytm-mask-video-overlay .ytm-vo-btn:hover {
+            background: rgba(28, 28, 34, 0.92);
+            border-color: rgba(0, 255, 255, 0.75);
+            color: #00ffff;
+            transform: scale(1.04);
+          }
+          #ytm-mask-video-overlay .ytm-vo-btn svg {
+            width: 17px;
+            height: 17px;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+          }
+          #ytm-mask-video-overlay[data-mode="normal"] .vo-only-pip,
+          #ytm-mask-video-overlay[data-mode="normal"] .vo-only-fs {
+            display: none !important;
+          }
+          #ytm-mask-video-overlay[data-mode="pip"] .vo-only-normal,
+          #ytm-mask-video-overlay[data-mode="pip"] .vo-only-fs {
+            display: none !important;
+          }
+          #ytm-mask-video-overlay[data-mode="fullscreen"] .vo-only-pip,
+          #ytm-mask-video-overlay[data-mode="fullscreen"] .vo-only-not-fs {
+            display: none !important;
+          }
+        `;
+        (document.head || document.documentElement).appendChild(styleEl);
+      }
+
+      if (document.documentElement) {
+        document.documentElement.classList.toggle("ytm-video-embed-mode", enabled);
+      }
+      if (document.body) {
+        document.body.classList.toggle("ytm-video-embed-mode", enabled);
+      }
+
+      // Build overlay using Trusted-Types-safe DOM APIs (music.youtube.com blocks innerHTML)
+      let overlay = document.getElementById("ytm-mask-video-overlay");
+      if (!overlay && document.body) {
+        try {
+          const SVG_NS = "http://www.w3.org/2000/svg";
+          const makeSvg = shapes => {
+            const svg = document.createElementNS(SVG_NS, "svg");
+            svg.setAttribute("viewBox", "0 0 24 24");
+            for (const [tag, attrs] of shapes) {
+              const node = document.createElementNS(SVG_NS, tag);
+              for (const [k, v] of Object.entries(attrs)) {
+                node.setAttribute(k, v);
+              }
+              svg.appendChild(node);
+            }
+            return svg;
+          };
+          const makeBtn = (extraClass, act, title, shapes) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "ytm-vo-btn" + (extraClass ? " " + extraClass : "");
+            btn.setAttribute("data-act", act);
+            btn.setAttribute("title", title);
+            btn.setAttribute("aria-label", title);
+            btn.appendChild(makeSvg(shapes));
+            return btn;
+          };
+
+          overlay = document.createElement("div");
+          overlay.id = "ytm-mask-video-overlay";
+
+          const topBar = document.createElement("div");
+          topBar.className = "ytm-vo-bar ytm-vo-top vo-only-pip";
+          topBar.appendChild(
+            makeBtn("", "exit_pip", "Back to normal view", [
+              ["polyline", { points: "15 3 21 3 21 9" }],
+              ["line", { x1: "21", y1: "3", x2: "14", y2: "10" }],
+              ["polyline", { points: "9 21 3 21 3 15" }],
+              ["line", { x1: "3", y1: "21", x2: "10", y2: "14" }],
+            ])
+          );
+          topBar.appendChild(
+            makeBtn("", "close_pip", "Close miniplayer (keeps playing)", [
+              ["line", { x1: "18", y1: "6", x2: "6", y2: "18" }],
+              ["line", { x1: "6", y1: "6", x2: "18", y2: "18" }],
+            ])
+          );
+
+          const bottomBar = document.createElement("div");
+          bottomBar.className = "ytm-vo-bar ytm-vo-bottom-right";
+          bottomBar.appendChild(
+            makeBtn("vo-only-normal", "enter_pip", "Miniplayer (Picture-in-Picture)", [
+              ["rect", { x: "3", y: "4", width: "18", height: "14", rx: "2" }],
+              ["rect", { x: "12", y: "10", width: "7", height: "5", rx: "1", fill: "currentColor", stroke: "none" }],
+            ])
+          );
+          bottomBar.appendChild(
+            makeBtn("vo-only-not-fs", "toggle_fullscreen", "Fullscreen", [
+              ["polyline", { points: "4 9 4 4 9 4" }],
+              ["polyline", { points: "15 4 20 4 20 9" }],
+              ["polyline", { points: "20 15 20 20 15 20" }],
+              ["polyline", { points: "9 20 4 20 4 15" }],
+            ])
+          );
+          bottomBar.appendChild(
+            makeBtn("vo-only-fs", "exit_fullscreen", "Exit fullscreen (Esc)", [
+              ["polyline", { points: "9 4 9 9 4 9" }],
+              ["polyline", { points: "20 9 15 9 15 4" }],
+              ["polyline", { points: "15 20 15 15 20 15" }],
+              ["polyline", { points: "4 15 9 15 9 20" }],
+            ])
+          );
+
+          overlay.appendChild(topBar);
+          overlay.appendChild(bottomBar);
+
+          let idleTimer = null;
+          const bumpActivity = () => {
+            overlay.classList.remove("vo-idle");
+            overlay.classList.add("vo-active");
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+              overlay.classList.remove("vo-active");
+              if (overlay.getAttribute("data-mode") === "fullscreen") {
+                overlay.classList.add("vo-idle");
+              }
+            }, 2200);
+          };
+          overlay.addEventListener("mousemove", bumpActivity);
+          overlay.addEventListener("mouseleave", () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            overlay.classList.remove("vo-active");
+            overlay.classList.remove("vo-idle");
+          });
+
+          overlay.addEventListener("click", e => {
+            const btn = e.target && e.target.closest && e.target.closest(".ytm-vo-btn");
+            e.preventDefault();
+            e.stopPropagation();
+            if (btn) {
+              const act = btn.getAttribute("data-act");
+              if (act) postVideoAction(act);
+              return;
+            }
+            // Single click directly on video cleanly toggles play/pause once (no YTM double-toggle)
+            window.__ytmMask.togglePlay();
+            bumpActivity();
+          });
+
+          overlay.addEventListener("dblclick", e => {
+            if (e.target && e.target.closest && e.target.closest(".ytm-vo-btn")) return;
+            e.preventDefault();
+            e.stopPropagation();
+            postVideoAction("toggle_fullscreen");
+          });
+
+          window.addEventListener(
+            "keydown",
+            e => {
+              if (
+                e.key === "Escape" &&
+                document.body &&
+                document.body.classList.contains("ytm-video-embed-mode") &&
+                overlay.getAttribute("data-mode") === "fullscreen"
+              ) {
+                e.preventDefault();
+                e.stopPropagation();
+                postVideoAction("exit_fullscreen");
+              }
+            },
+            true
+          );
+
+          document.body.appendChild(overlay);
+        } catch (_) {}
+      }
+
+      if (overlay) {
+        overlay.setAttribute("data-mode", m);
+        overlay.classList.remove("vo-idle");
+      }
+      this.syncVideoSize();
+      setTimeout(() => this.syncVideoSize(), 140);
+      setTimeout(() => this.syncVideoSize(), 360);
+    },
+    syncVideoSize() {
+      try {
+        window.dispatchEvent(new Event("resize"));
+        const mp = document.querySelector("#movie_player");
+        if (mp && typeof mp.setSize === "function" && window.innerWidth > 0 && window.innerHeight > 0) {
+          mp.setSize(window.innerWidth, window.innerHeight);
+        }
+      } catch (_) {}
     },
     goBack() {
       closePlayerOverlayIfOpen();
@@ -2321,6 +3053,132 @@
     requestQueue() {
       openPlayerTab("up next");
     },
+    playQueueItem(idx) {
+      const i = Number(idx);
+      const items = getVisibleQueueItems();
+      if (!Number.isInteger(i) || i < 0 || i >= items.length) return;
+      const item = items[i];
+      const wasSelected = item.hasAttribute("selected");
+      const playRenderer = item.querySelector("ytmusic-play-button-renderer, .play-button");
+      const innerBtn =
+        (playRenderer &&
+          playRenderer.querySelector(".content-wrapper, button, #play-button, yt-icon")) ||
+        playRenderer ||
+        item.querySelector(".left-items") ||
+        item;
+
+      clickEl(innerBtn);
+
+      if (!wasSelected) {
+        setTimeout(() => {
+          const curItems = getVisibleQueueItems();
+          const curItem = curItems[i] || item;
+          if (curItem && curItem.hasAttribute("selected")) {
+            sendState(true);
+            return;
+          }
+          if (playRenderer && playRenderer !== innerBtn) {
+            clickEl(playRenderer);
+          }
+          try {
+            curItem.dispatchEvent(
+              new MouseEvent("dblclick", { bubbles: true, cancelable: true, composed: true })
+            );
+          } catch (_) {}
+          const ep =
+            (playRenderer && playRenderer.playNavigationEndpoint) ||
+            (curItem.data && curItem.data.navigationEndpoint) ||
+            (curItem.__data && curItem.__data.data && curItem.__data.data.navigationEndpoint);
+          if (ep) {
+            spaNavigateEndpoint(ep, null);
+          }
+          setTimeout(() => sendState(true), 250);
+          setTimeout(() => sendState(true), 750);
+        }, 180);
+      } else {
+        scheduleSync(180);
+        setTimeout(() => sendState(true), 500);
+      }
+    },
+    moveQueueItem(fromIdx, toIdx) {
+      const from = Number(fromIdx);
+      const to = Number(toIdx);
+      if (!Number.isInteger(from) || !Number.isInteger(to) || from === to || from < 0 || to < 0) {
+        return;
+      }
+
+      const queue = getActiveQueueContainer();
+      const items = getVisibleQueueItems();
+      if (!queue || from >= items.length || to >= items.length) return;
+
+      const movedTitle = cleanText(items[from].querySelector(".song-title"));
+
+      // 1. Primary path: dispatch YouTube Music's real queue-store MOVE_ITEM action / event
+      let dispatched = false;
+      try {
+        const store =
+          queue.store ||
+          (document.querySelector("ytmusic-app") && document.querySelector("ytmusic-app").store);
+        if (store && typeof store.dispatch === "function") {
+          store.dispatch({
+            type: "MOVE_ITEM",
+            payload: { fromIndex: from, toIndex: to },
+          });
+          dispatched = true;
+        } else if (typeof queue.dispatch === "function") {
+          queue.dispatch({
+            type: "MOVE_ITEM",
+            payload: { fromIndex: from, toIndex: to },
+          });
+          dispatched = true;
+        }
+      } catch (_) {}
+
+      // 2. Also fire real DOM drag gesture if store dispatch didn't move the item
+      setTimeout(() => {
+        const after = getVisibleQueueItems();
+        const atTarget = after[to] && cleanText(after[to].querySelector(".song-title"));
+        if (dispatched && atTarget === movedTitle) {
+          sendState(true);
+          return;
+        }
+        try {
+          const curItems = getVisibleQueueItems();
+          const srcEl = curItems[from];
+          const dstEl = curItems[to];
+          if (!srcEl || !dstEl) return;
+          srcEl.scrollIntoView({ block: "nearest" });
+          const sRect = srcEl.getBoundingClientRect();
+          const dRect = dstEl.getBoundingClientRect();
+          const sx = sRect.left + sRect.width * 0.5;
+          const sy = sRect.top + sRect.height * 0.5;
+          const dx = dRect.left + dRect.width * 0.5;
+          const dy = from < to ? dRect.bottom - 4 : dRect.top + 4;
+
+          const fire = (target, type, x, y, buttons) => {
+            target.dispatchEvent(
+              new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                clientX: x,
+                clientY: y,
+                buttons,
+              })
+            );
+          };
+
+          fire(srcEl, "mousedown", sx, sy, 1);
+          const steps = 6;
+          for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            fire(document, "mousemove", sx + (dx - sx) * t, sy + (dy - sy) * t, 1);
+          }
+          fire(document, "mouseup", dx, dy, 0);
+        } catch (_) {}
+        setTimeout(() => sendState(true), 260);
+      }, 120);
+    },
     requestLyrics() {
       lyricsRequested = true;
       openPlayerTab("lyrics");
@@ -2329,9 +3187,30 @@
       relatedRequested = true;
       openPlayerTab("related");
     },
-    closePlayerPage() {
+    closePlayerPage(fallbackUrl) {
       closePlayerOverlayIfOpen();
-      setTimeout(() => sendState(true), 200);
+      setTimeout(() => {
+        if (isPlayerPageOpen()) {
+          closePlayerOverlayIfOpen();
+        }
+        const stillWatch = isWatchUrl(window.location.href);
+        const missingBrowse = !hasVisibleBrowseContent();
+        if (stillWatch || missingBrowse) {
+          const target =
+            fallbackUrl && !isWatchUrl(fallbackUrl)
+              ? fallbackUrl
+              : stillWatch
+                ? "https://music.youtube.com/"
+                : null;
+          if (target) {
+            spaNavigateEndpoint(endpointForUrl(target), target);
+            setTimeout(() => sendState(true), 450);
+            setTimeout(() => sendState(true), 1100);
+            return;
+          }
+        }
+        sendState(true);
+      }, 240);
     },
     openSignIn() {
       const link = document.querySelector("a.sign-in-link, ytmusic-nav-bar a[href*='ServiceLogin']");

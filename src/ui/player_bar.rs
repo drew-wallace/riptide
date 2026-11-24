@@ -86,57 +86,12 @@ pub fn render_player_bar(
         .flex()
         .flex_col()
         .w_full()
-        .h(px(94.0))
+        .h(px(90.0))
         .flex_shrink_0()
         .bg(TidalTheme::bg_player())
-        // Live hover timestamp tooltip pill floating directly above the progress bar
-        .when_some(hover_preview, |el, (left, label)| {
-            el.child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(-26.0))
-                    .w(px(56.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .bg(TidalTheme::bg_surface_active())
-                    .border_1()
-                    .border_color(TidalTheme::accent())
-                    .shadow_md()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(TidalTheme::text_primary())
-                    .child(label),
-            )
-        })
-        // Signature TIDAL full-width top edge progress scrubber (flush inside bar so no border clips the thumb)
-        .child(
-            div().id("player-progress-wrap").w_full().h(px(14.0)).child(
-                ScrubBar::new(
-                    "player-progress-bar",
-                    progress,
-                    dragging_progress,
-                    move |frac, commit, _, cx| {
-                        app_entity_seek.update(cx, |this, cx| {
-                            this.seek_live(frac, commit, cx);
-                        });
-                    },
-                )
-                .height(px(14.0))
-                .track_height(px(3.5))
-                .fill_color(TidalTheme::accent())
-                .show_thumb(player.has_media)
-                .on_hover(hover_active, move |hover, _, cx| {
-                    app_entity_hover.update(cx, |this, cx| {
-                        this.set_progress_hover(hover, cx);
-                    });
-                }),
-            ),
-        )
-        // Main 3-column player bar content
+        .border_t_1()
+        .border_color(TidalTheme::border_subtle())
+        // Main 3-column TIDAL player bar content
         .child(
             div()
                 .flex()
@@ -144,16 +99,35 @@ pub fn render_player_bar(
                 .justify_between()
                 .flex_1()
                 .px_5()
-                .pb_1()
                 // LEFT: Now Playing artwork + track info + like/dislike
-                .child(
+                .child({
+                    let player_art_zoom = player.artwork_url.clone();
+                    let art_el = if let Some(zoom_url) = player_art_zoom {
+                        div()
+                            .id("player-artwork-zoom")
+                            .cursor_pointer()
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .hover(|s| s.border_color(TidalTheme::accent()))
+                            .tooltip(tidal_tooltip("View full artwork", None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_artwork_lightbox(zoom_url.clone(), false, cx);
+                            }))
+                            .child(artwork_box(player.artwork_url.as_deref(), px(56.0), false))
+                            .into_any_element()
+                    } else {
+                        artwork_box(None, px(56.0), false)
+                    };
+
                     div()
                         .flex()
                         .items_center()
                         .gap_3p5()
-                        .w(px(370.0))
+                        .w(px(320.0))
+                        .flex_shrink_0()
                         .min_w_0()
-                        .child(artwork_box(player.artwork_url.as_deref(), px(56.0), false))
+                        .child(art_el)
                         .child(
                             div()
                                 .flex()
@@ -243,15 +217,18 @@ pub fn render_player_bar(
                                         }))
                                         .child("⊘"),
                                 ),
-                        ),
-                )
-                // CENTER: Tidal Transport Controls + Timestamps
+                        )
+                })
+                // CENTER: TIDAL Transport Controls + Inline Progress Scrubber with Timestamps
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .items_center()
-                        .gap_1()
+                        .flex_1()
+                        .max_w(px(560.0))
+                        .px_6()
+                        .gap_1p5()
                         .child(
                             div()
                                 .flex()
@@ -270,12 +247,10 @@ pub fn render_player_bar(
                                     WebCommand::ToggleShuffle,
                                     cx,
                                 ))
-                                .child(transport_icon_btn(
+                                .child(transport_skip_btn(
                                     "btn-prev",
-                                    "⏮",
+                                    true,
                                     "Previous track",
-                                    None,
-                                    false,
                                     WebCommand::PrevTrack,
                                     cx,
                                 ))
@@ -286,12 +261,12 @@ pub fn render_player_bar(
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .w(px(44.0))
-                                        .h(px(44.0))
+                                        .w(px(40.0))
+                                        .h(px(40.0))
                                         .rounded_full()
                                         .bg(TidalTheme::text_primary())
                                         .hover(|s| s.bg(TidalTheme::accent()))
-                                        .text_lg()
+                                        .text_base()
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(TidalTheme::text_inverse())
                                         .tooltip(tidal_tooltip(
@@ -303,12 +278,10 @@ pub fn render_player_bar(
                                         }))
                                         .child(if is_playing { "❚❚" } else { "▶" }),
                                 )
-                                .child(transport_icon_btn(
+                                .child(transport_skip_btn(
                                     "btn-next",
-                                    "⏭",
-                                    "Next track",
-                                    None,
                                     false,
+                                    "Next track",
                                     WebCommand::NextTrack,
                                     cx,
                                 ))
@@ -325,16 +298,59 @@ pub fn render_player_bar(
                                     cx,
                                 )),
                         )
+                        // Inline TIDAL progress scrubber flanked by elapsed and total timestamps
                         .child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_1p5()
-                                .text_size(px(11.0))
-                                .text_color(TidalTheme::text_muted())
-                                .child(elapsed_str)
-                                .child("/")
-                                .child(total_str),
+                                .w_full()
+                                .gap_2p5()
+                                .child(
+                                    div()
+                                        .w(px(36.0))
+                                        .flex_shrink_0()
+                                        .text_right()
+                                        .text_size(px(11.0))
+                                        .text_color(TidalTheme::text_muted())
+                                        .child(elapsed_str),
+                                )
+                                .child(
+                                    div()
+                                        .id("player-progress-wrap")
+                                        .flex_1()
+                                        .min_w(px(120.0))
+                                        .h(px(14.0))
+                                        .child(
+                                            ScrubBar::new(
+                                                "player-progress-bar",
+                                                progress,
+                                                dragging_progress,
+                                                move |frac, commit, _, cx| {
+                                                    app_entity_seek.update(cx, |this, cx| {
+                                                        this.seek_live(frac, commit, cx);
+                                                    });
+                                                },
+                                            )
+                                            .height(px(14.0))
+                                            .track_height(px(3.5))
+                                            .fill_color(TidalTheme::text_primary())
+                                            .show_thumb(player.has_media)
+                                            .on_hover(hover_active, move |hover, _, cx| {
+                                                app_entity_hover.update(cx, |this, cx| {
+                                                    this.set_progress_hover(hover, cx);
+                                                });
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(36.0))
+                                        .flex_shrink_0()
+                                        .text_left()
+                                        .text_size(px(11.0))
+                                        .text_color(TidalTheme::text_muted())
+                                        .child(total_str),
+                                ),
                         ),
                 )
                 // RIGHT: Stream Pill + Lyrics + Queue + Volume
@@ -344,7 +360,8 @@ pub fn render_player_bar(
                         .items_center()
                         .justify_end()
                         .gap_3()
-                        .w(px(370.0))
+                        .w(px(320.0))
+                        .flex_shrink_0()
                         .child(
                             div()
                                 .id("stream-badge")
@@ -483,6 +500,29 @@ pub fn render_player_bar(
                         ),
                 ),
         )
+        // Live hover timestamp tooltip pill floating directly above the centered progress bar
+        .when_some(hover_preview, |el, (left, label)| {
+            el.child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .bottom(px(30.0))
+                    .w(px(56.0))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .bg(TidalTheme::bg_surface_active())
+                    .border_1()
+                    .border_color(TidalTheme::accent())
+                    .shadow_md()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(TidalTheme::text_primary())
+                    .child(label),
+            )
+        })
 }
 
 fn transport_icon_btn(
@@ -518,6 +558,53 @@ fn transport_icon_btn(
             this.controller.send(cmd.clone());
         }))
         .child(glyph)
+}
+
+/// Crisp monochrome Previous (`|◀`) / Next (`▶|`) transport button (avoids Windows' color emoji for ⏮ / ⏭).
+fn transport_skip_btn(
+    id: &'static str,
+    is_prev: bool,
+    tip: &'static str,
+    cmd: WebCommand,
+    cx: &mut Context<YtmTidalApp>,
+) -> impl IntoElement {
+    let group_name: gpui::SharedString = id.into();
+    let bar = div()
+        .w(px(2.0))
+        .h(px(12.0))
+        .rounded(px(1.0))
+        .bg(TidalTheme::text_secondary())
+        .group_hover(group_name.clone(), |s| s.bg(TidalTheme::text_primary()));
+    let arrow = div()
+        .text_sm()
+        .line_height(px(14.0))
+        .text_color(TidalTheme::text_secondary())
+        .group_hover(group_name.clone(), |s| {
+            s.text_color(TidalTheme::text_primary())
+        })
+        .child(if is_prev { "◀\u{FE0E}" } else { "▶\u{FE0E}" });
+
+    div()
+        .id(id)
+        .group(group_name)
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(1.0))
+        .w(px(38.0))
+        .h(px(38.0))
+        .rounded_full()
+        .hover(|s| s.bg(TidalTheme::bg_surface_hover()))
+        .tooltip(tidal_tooltip(tip, None))
+        .on_click(cx.listener(move |this, _, _, _| {
+            this.controller.send(cmd.clone());
+        }))
+        .children(if is_prev {
+            [bar.into_any_element(), arrow.into_any_element()]
+        } else {
+            [arrow.into_any_element(), bar.into_any_element()]
+        })
 }
 
 fn drawer_toggle_btn(

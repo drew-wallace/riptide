@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -13,8 +13,8 @@ use gpui::{
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::protocol::{
-    BridgeState, FeedArtistSource, FeedRelease, Route, ShareDialog, ShareTarget, WebCommand,
-    WebEvent,
+    BridgeState, FeedArtistSource, FeedRelease, PlaybackMode, Route, ShareDialog, ShareTarget,
+    VideoEmbedMode, VideoUiAction, VideoViewport, WebCommand, WebEvent,
 };
 use crate::settings::{AppSettings, FeedCache};
 use crate::smooth_scroll::SmoothScroller;
@@ -25,6 +25,7 @@ use crate::time_util::{
 };
 use crate::ui::{content, drawer, feed_view, overlays, player_bar, settings_view, sidebar, topbar};
 use crate::webview::WebController;
+use crate::win_video;
 
 actions!(
     ytm_app,
@@ -108,8 +109,6 @@ pub enum ScrollTarget {
 #[derive(Debug, Clone)]
 pub struct ArtworkLightbox {
     pub url: String,
-    pub title: String,
-    pub subtitle: String,
     pub is_circular: bool,
 }
 
@@ -154,6 +153,7 @@ pub struct YtmTidalApp {
     pub new_playlist_desc: Entity<SearchInput>,
     pub new_playlist_privacy: PlaylistPrivacy,
     pub show_new_playlist_modal: bool,
+    pub editing_playlist_form: bool,
     pub menu_open: bool,
     pub menu_position: Point<Pixels>,
     pub feed_item_menu: Option<(FeedRelease, Point<Pixels>)>,
@@ -161,6 +161,11 @@ pub struct YtmTidalApp {
     pub share_copied_until: Option<Instant>,
     pub artwork_lightbox: Option<ArtworkLightbox>,
     pub drawer_tab: Option<DrawerTab>,
+    pub video_pip: bool,
+    pub video_fullscreen: bool,
+    /// Exact client-space `(x, y, w, h, scale_factor)` of the 16:9 video slot (Normal or PiP).
+    pub video_slot_bounds: Arc<Mutex<Option<(f32, f32, f32, f32, f32)>>>,
+    last_video_viewport: Option<VideoViewport>,
     pub webview_visible: bool,
     pub status_message: String,
     pub dragging_progress: Arc<AtomicBool>,
@@ -175,6 +180,7 @@ pub struct YtmTidalApp {
     expected_history_url: Option<String>,
     pending_restore_scroll: Option<(String, Point<Pixels>, u8)>,
     startup_feed_checked: bool,
+    last_bridge_session_id: String,
     volume_restored_on_connect: bool,
     volume_restored_on_media: bool,
     last_volume_ipc: Instant,
@@ -229,6 +235,7 @@ impl YtmTidalApp {
 
         let search_sub = cx.subscribe(&search_input, |this, _, ev, cx| match ev {
             SearchInputEvent::Submit(query) => {
+                this.dismiss_drawer_for_nav();
                 this.save_active_scroll();
                 this.active_view = ActiveView::Webapp;
                 this.expected_history_url = None;
@@ -265,6 +272,13 @@ impl YtmTidalApp {
                 let updated = this.update(cx, |app, cx| {
                     match event {
                         WebEvent::StateSync(mut new_state) => {
+                            if !new_state.bridge_session_id.is_empty()
+                                && new_state.bridge_session_id != app.last_bridge_session_id
+                            {
+                                app.last_bridge_session_id = new_state.bridge_session_id.clone();
+                                app.volume_restored_on_connect = false;
+                                app.volume_restored_on_media = false;
+                            }
                             if app.dragging_volume.load(Ordering::Relaxed)
                                 || !app.volume_restored_on_connect
                             {
@@ -275,10 +289,9 @@ impl YtmTidalApp {
                                 new_state.player.current_time = app.state.player.current_time;
                             }
 
-                            let same_url =
-                                !app.state.url.is_empty() && new_state.url == app.state.url;
-                            if same_url
-                                && new_state.player_page_open
+                            let on_watch_or_player =
+                                new_state.player_page_open || is_watch_url(&new_state.url);
+                            if on_watch_or_player
                                 && new_state.shelves.is_empty()
                                 && new_state.header.is_none()
                                 && (!app.state.shelves.is_empty() || app.state.header.is_some())
@@ -289,6 +302,7 @@ impl YtmTidalApp {
                                 new_state.empty_state = app.state.empty_state.clone();
                                 new_state.page_ready = app.state.page_ready;
                                 new_state.has_more = app.state.has_more;
+                                new_state.route = app.state.route;
                             }
 
                             let prev_url = app.state.url.clone();
@@ -297,7 +311,28 @@ impl YtmTidalApp {
                                 app.handle_webapp_url_transition(&next_url);
                             }
 
+                            let prev_had_form = app.state.playlist_form.is_some();
                             app.state = *new_state;
+                            if let Some(ref form) = app.state.playlist_form {
+                                if !prev_had_form && !app.show_new_playlist_modal {
+                                    let title = form.title.clone();
+                                    let desc = form.description.clone();
+                                    app.new_playlist_privacy = match form.privacy.as_str() {
+                                        "public" => PlaylistPrivacy::Public,
+                                        "unlisted" => PlaylistPrivacy::Unlisted,
+                                        _ => PlaylistPrivacy::Private,
+                                    };
+                                    app.editing_playlist_form = true;
+                                    app.new_playlist_title.update(cx, |inp, cx| {
+                                        inp.set_text(&title, cx);
+                                    });
+                                    app.new_playlist_desc.update(cx, |inp, cx| {
+                                        inp.set_text(&desc, cx);
+                                    });
+                                }
+                            } else {
+                                app.editing_playlist_form = false;
+                            }
                             if app.state.connected {
                                 app.status_message.clear();
                                 if !app.volume_restored_on_connect {
@@ -320,6 +355,11 @@ impl YtmTidalApp {
                                     app.settings.volume.min(100)
                                 };
                                 app.controller.send(WebCommand::SetVolume(target_vol));
+                            }
+
+                            if app.state.player.playback_mode != PlaybackMode::Video {
+                                app.video_pip = false;
+                                app.video_fullscreen = false;
                             }
 
                             // Trigger startup / missed-schedule Feed refresh once signed in
@@ -352,6 +392,13 @@ impl YtmTidalApp {
                         WebEvent::WebViewVisibilityChanged(visible) => {
                             app.webview_visible = visible;
                         }
+                        WebEvent::VideoAction(action) => match action {
+                            VideoUiAction::EnterPip => app.enter_video_pip(cx),
+                            VideoUiAction::ExitPipToNormal => app.exit_video_pip_to_normal(cx),
+                            VideoUiAction::ClosePip => app.close_video_pip(cx),
+                            VideoUiAction::ToggleFullscreen => app.toggle_video_fullscreen(cx),
+                            VideoUiAction::ExitFullscreen => app.exit_video_fullscreen(cx),
+                        },
                         WebEvent::StatusMessage(msg) => {
                             app.status_message = msg;
                         }
@@ -372,6 +419,20 @@ impl YtmTidalApp {
                 Timer::after(Duration::from_secs(30)).await;
                 let keep_going = this.update(cx, |app, cx| {
                     app.check_daily_feed_schedule(cx);
+                });
+                if keep_going.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Lightweight 40ms video viewport position tracker (active ONLY while Video mode is showing)
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(40)).await;
+                let keep_going = this.update(cx, |app, _cx| {
+                    app.sync_embedded_video_rect(false);
                 });
                 if keep_going.is_err() {
                     break;
@@ -413,6 +474,7 @@ impl YtmTidalApp {
             new_playlist_desc,
             new_playlist_privacy: PlaylistPrivacy::Private,
             show_new_playlist_modal: false,
+            editing_playlist_form: false,
             menu_open: false,
             menu_position: point(px(200.0), px(200.0)),
             feed_item_menu: None,
@@ -420,6 +482,10 @@ impl YtmTidalApp {
             share_copied_until: None,
             artwork_lightbox: None,
             drawer_tab: None,
+            video_pip: false,
+            video_fullscreen: false,
+            video_slot_bounds: Arc::new(Mutex::new(None)),
+            last_video_viewport: None,
             webview_visible,
             status_message: "Launching embedded YouTube Music webapp…".to_string(),
             dragging_progress: Arc::new(AtomicBool::new(false)),
@@ -433,6 +499,7 @@ impl YtmTidalApp {
             expected_history_url: None,
             pending_restore_scroll: None,
             startup_feed_checked: false,
+            last_bridge_session_id: String::new(),
             volume_restored_on_connect: false,
             volume_restored_on_media: false,
             last_volume_ipc: past,
@@ -568,12 +635,35 @@ impl YtmTidalApp {
     }
 
     pub fn can_go_back(&self) -> bool {
-        self.nav_idx.is_some_and(|i| i > 0)
+        self.drawer_tab.is_some() || self.nav_idx.is_some_and(|i| i > 0)
     }
 
     pub fn can_go_forward(&self) -> bool {
         self.nav_idx
             .is_some_and(|i| i + 1 < self.nav_history.len())
+    }
+
+    fn current_webapp_history_url(&self) -> Option<String> {
+        let idx = self.nav_idx?;
+        if let Some(NavHistoryEntry {
+            target: NavTarget::Webapp(url),
+            ..
+        }) = self.nav_history.get(idx)
+            && !is_watch_url(url)
+        {
+            return Some(url.clone());
+        }
+        for i in (0..=idx).rev() {
+            if let Some(NavHistoryEntry {
+                target: NavTarget::Webapp(url),
+                ..
+            }) = self.nav_history.get(i)
+                && !is_watch_url(url)
+            {
+                return Some(url.clone());
+            }
+        }
+        Some("https://music.youtube.com/".to_string())
     }
 
     fn current_scroll_offset(&self) -> Point<Pixels> {
@@ -609,6 +699,12 @@ impl YtmTidalApp {
     }
 
     fn handle_webapp_url_transition(&mut self, next_url: &str) {
+        // Never record /watch?v=... player-overlay URLs in browse history;
+        // Up Next / Queue is a drawer over the current browse page, not a browse route.
+        if is_watch_url(next_url) {
+            return;
+        }
+
         // Ignore transitions we explicitly triggered via unified Back/Forward navigation
         if let Some(ref expected) = self.expected_history_url {
             if expected == next_url || urls_match_loosely(expected, next_url) {
@@ -722,7 +818,14 @@ impl YtmTidalApp {
         }
     }
 
+    fn dismiss_drawer_for_nav(&mut self) {
+        if self.drawer_tab.take().is_some() {
+            self.controller.send(WebCommand::ClosePlayerPage(None));
+        }
+    }
+
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        self.dismiss_drawer_for_nav();
         let was_local = self.active_view != ActiveView::Webapp;
         self.save_active_scroll();
         self.active_view = ActiveView::Webapp;
@@ -730,7 +833,11 @@ impl YtmTidalApp {
         self.pending_restore_scroll = None;
 
         // If returning from Feed/Settings to the exact route WebView is already displaying, push it explicitly
-        if was_local && self.state.route == route && !self.state.url.is_empty() {
+        if was_local
+            && self.state.route == route
+            && !self.state.url.is_empty()
+            && !is_watch_url(&self.state.url)
+        {
             let url = self.state.url.clone();
             self.push_nav_entry(NavTarget::Webapp(url));
             self.content_scroll.set_immediate(point(px(0.0), px(0.0)));
@@ -741,6 +848,7 @@ impl YtmTidalApp {
     }
 
     pub fn navigate_url_from_local(&mut self, url: String, cx: &mut Context<Self>) {
+        self.dismiss_drawer_for_nav();
         let was_local = self.active_view != ActiveView::Webapp;
         self.save_active_scroll();
         self.active_view = ActiveView::Webapp;
@@ -753,7 +861,7 @@ impl YtmTidalApp {
             format!("https://music.youtube.com/{}", url.trim_start_matches('/'))
         };
 
-        if was_local && urls_match_loosely(&full, &self.state.url) {
+        if was_local && !is_watch_url(&full) && urls_match_loosely(&full, &self.state.url) {
             self.push_nav_entry(NavTarget::Webapp(self.state.url.clone()));
             self.content_scroll.set_immediate(point(px(0.0), px(0.0)));
         } else {
@@ -766,6 +874,7 @@ impl YtmTidalApp {
         if !self.settings.feed_enabled {
             return;
         }
+        self.dismiss_drawer_for_nav();
         self.push_nav_entry(NavTarget::Feed);
         self.active_view = ActiveView::Feed;
         self.feed_scroll.set_immediate(point(px(0.0), px(0.0)));
@@ -779,6 +888,7 @@ impl YtmTidalApp {
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_drawer_for_nav();
         self.push_nav_entry(NavTarget::Settings);
         self.active_view = ActiveView::Settings;
         self.settings_scroll.set_immediate(point(px(0.0), px(0.0)));
@@ -786,6 +896,10 @@ impl YtmTidalApp {
     }
 
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.drawer_tab.is_some() {
+            self.close_drawer(cx);
+            return;
+        }
         let Some(idx) = self.nav_idx else { return };
         if idx == 0 {
             return;
@@ -795,6 +909,7 @@ impl YtmTidalApp {
     }
 
     pub fn go_forward(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_drawer_for_nav();
         let Some(idx) = self.nav_idx else { return };
         if idx + 1 >= self.nav_history.len() {
             return;
@@ -827,6 +942,10 @@ impl YtmTidalApp {
                 if urls_match_loosely(&url, &self.state.url) {
                     self.expected_history_url = None;
                     self.content_scroll.set_immediate(entry.scroll);
+                    if self.state.player_page_open {
+                        self.controller
+                            .send(WebCommand::ClosePlayerPage(Some(url)));
+                    }
                 } else {
                     self.expected_history_url = Some(url.clone());
                     self.controller.send(WebCommand::NavigateUrl(url));
@@ -934,6 +1053,10 @@ impl YtmTidalApp {
 
     pub fn close_new_playlist_modal(&mut self, cx: &mut Context<Self>) {
         self.show_new_playlist_modal = false;
+        if self.editing_playlist_form {
+            self.editing_playlist_form = false;
+            self.controller.send(WebCommand::CloseMenu);
+        }
         cx.notify();
     }
 
@@ -945,13 +1068,125 @@ impl YtmTidalApp {
         let description = self.new_playlist_desc.read(cx).text().trim().to_string();
         let privacy = self.new_playlist_privacy.as_str().to_string();
 
-        self.show_new_playlist_modal = false;
-        self.controller.send(WebCommand::CreatePlaylist {
-            title,
-            description,
-            privacy,
-        });
+        if self.editing_playlist_form {
+            self.editing_playlist_form = false;
+            self.controller.send(WebCommand::SavePlaylistForm {
+                title,
+                description,
+                privacy,
+            });
+        } else {
+            self.show_new_playlist_modal = false;
+            self.controller.send(WebCommand::CreatePlaylist {
+                title,
+                description,
+                privacy,
+            });
+        }
         cx.notify();
+    }
+
+    fn has_active_overlay(&self) -> bool {
+        self.artwork_lightbox.is_some()
+            || self.local_share_dialog.is_some()
+            || self.state.share_dialog.is_some()
+            || self.state.confirm_dialog.is_some()
+            || self.show_new_playlist_modal
+            || self.editing_playlist_form
+            || self.state.playlist_form.is_some()
+            || !self.state.add_to_playlist.is_empty()
+            || self.feed_item_menu.is_some()
+            || (self.menu_open && !self.state.popup_menu.is_empty())
+    }
+
+    pub fn enter_video_pip(&mut self, cx: &mut Context<Self>) {
+        if self.state.player.playback_mode != PlaybackMode::Video {
+            return;
+        }
+        self.video_fullscreen = false;
+        self.video_pip = true;
+        if let Ok(mut guard) = self.video_slot_bounds.lock() {
+            *guard = None;
+        }
+        if self.drawer_tab.is_some() {
+            self.close_drawer(cx);
+        } else {
+            self.sync_embedded_video_rect(true);
+            cx.notify();
+        }
+    }
+
+    pub fn exit_video_pip_to_normal(&mut self, cx: &mut Context<Self>) {
+        self.video_pip = false;
+        self.video_fullscreen = false;
+        if let Ok(mut guard) = self.video_slot_bounds.lock() {
+            *guard = None;
+        }
+        self.open_drawer(DrawerTab::Queue, cx);
+    }
+
+    pub fn close_video_pip(&mut self, cx: &mut Context<Self>) {
+        self.video_pip = false;
+        self.video_fullscreen = false;
+        self.sync_embedded_video_rect(true);
+        cx.notify();
+    }
+
+    pub fn toggle_video_fullscreen(&mut self, cx: &mut Context<Self>) {
+        if self.video_fullscreen {
+            self.exit_video_fullscreen(cx);
+        } else if self.state.player.playback_mode == PlaybackMode::Video {
+            self.video_fullscreen = true;
+            self.sync_embedded_video_rect(true);
+            cx.notify();
+        }
+    }
+
+    pub fn exit_video_fullscreen(&mut self, cx: &mut Context<Self>) {
+        if !self.video_fullscreen {
+            return;
+        }
+        self.video_fullscreen = false;
+        self.sync_embedded_video_rect(true);
+        cx.notify();
+    }
+
+    pub fn sync_embedded_video_rect(&mut self, force_hide_check: bool) {
+        let is_video = self.state.player.playback_mode == PlaybackMode::Video;
+        let mode = if !is_video || self.webview_visible || self.has_active_overlay() {
+            None
+        } else if self.video_fullscreen {
+            Some(VideoEmbedMode::Fullscreen)
+        } else if self.drawer_tab.is_some() {
+            Some(VideoEmbedMode::Normal)
+        } else if self.video_pip {
+            Some(VideoEmbedMode::Pip)
+        } else {
+            None
+        };
+
+        let next_viewport = mode.and_then(|m| {
+            let rect = match m {
+                VideoEmbedMode::Fullscreen => win_video::host_monitor_screen_rect("Riptide"),
+                VideoEmbedMode::Normal | VideoEmbedMode::Pip => {
+                    let slot = self.video_slot_bounds.lock().ok().and_then(|g| *g);
+                    slot.and_then(|(x, y, w, h, scale)| {
+                        win_video::host_video_screen_rect("Riptide", x, y, w, h, scale)
+                    })
+                }
+            }?;
+            Some(VideoViewport { rect, mode: m })
+        });
+
+        if next_viewport != self.last_video_viewport
+            || (force_hide_check
+                && next_viewport.is_none()
+                && self.last_video_viewport.is_some())
+        {
+            self.last_video_viewport = next_viewport;
+            self.controller
+                .send(WebCommand::SyncVideoViewport(next_viewport));
+        }
     }
 
     pub fn open_context_menu(
@@ -1108,15 +1343,11 @@ impl YtmTidalApp {
     pub fn open_artwork_lightbox(
         &mut self,
         url: String,
-        title: String,
-        subtitle: String,
         is_circular: bool,
         cx: &mut Context<Self>,
     ) {
         self.artwork_lightbox = Some(ArtworkLightbox {
             url: upscale_artwork_url(&url),
-            title,
-            subtitle,
             is_circular,
         });
         cx.notify();
@@ -1180,7 +1411,18 @@ impl YtmTidalApp {
 
     pub fn close_drawer(&mut self, cx: &mut Context<Self>) {
         self.drawer_tab = None;
-        self.controller.send(WebCommand::ClosePlayerPage);
+        if self.active_view == ActiveView::Webapp {
+            let fallback_url = self.current_webapp_history_url();
+            if let Some(ref url) = fallback_url
+                && (is_watch_url(&self.state.url) || self.state.player_page_open)
+            {
+                self.expected_history_url = Some(url.clone());
+            }
+            self.controller
+                .send(WebCommand::ClosePlayerPage(fallback_url));
+        } else {
+            self.controller.send(WebCommand::ClosePlayerPage(None));
+        }
         cx.notify();
     }
 
@@ -1196,12 +1438,38 @@ impl YtmTidalApp {
         if self.drawer_tab != Some(tab) {
             self.drawer_scroll.set_immediate(point(px(0.0), px(0.0)));
         }
+        if self.video_pip {
+            self.video_pip = false;
+            if let Ok(mut guard) = self.video_slot_bounds.lock() {
+                *guard = None;
+            }
+        }
         self.drawer_tab = Some(tab);
         match tab {
             DrawerTab::Queue => self.controller.send(WebCommand::RequestQueue),
             DrawerTab::Lyrics => self.controller.send(WebCommand::RequestLyrics),
             DrawerTab::Related => self.controller.send(WebCommand::RequestRelated),
         }
+        cx.notify();
+    }
+
+    pub fn move_queue_item(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let len = self.state.queue.len();
+        if from == to || from >= len || to >= len {
+            return;
+        }
+        let item = self.state.queue.remove(from);
+        self.state.queue.insert(to, item);
+        self.controller.send(WebCommand::MoveQueueItem { from, to });
+        cx.notify();
+    }
+
+    pub fn play_queue_item(&mut self, idx: usize, cx: &mut Context<Self>) {
+        // Optimistically mark the clicked row as playing without scrolling Up Next
+        for (i, item) in self.state.queue.iter_mut().enumerate() {
+            item.is_playing = i == idx;
+        }
+        self.controller.send(WebCommand::PlayQueueItem(idx));
         cx.notify();
     }
 
@@ -1212,7 +1480,10 @@ impl YtmTidalApp {
     }
 
     fn on_toggle_play(&mut self, _: &TogglePlayPause, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.any_input_focused(window, cx) && !self.show_new_playlist_modal {
+        if !self.any_input_focused(window, cx)
+            && !self.show_new_playlist_modal
+            && !self.editing_playlist_form
+        {
             self.controller.send(WebCommand::TogglePlay);
         }
     }
@@ -1239,11 +1510,13 @@ impl YtmTidalApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.artwork_lightbox.is_some() {
+        if self.video_fullscreen {
+            self.exit_video_fullscreen(cx);
+        } else if self.artwork_lightbox.is_some() {
             self.close_artwork_lightbox(cx);
         } else if self.local_share_dialog.is_some() || self.state.share_dialog.is_some() {
             self.close_share_dialog(cx);
-        } else if self.show_new_playlist_modal {
+        } else if self.show_new_playlist_modal || self.editing_playlist_form {
             self.close_new_playlist_modal(cx);
         } else if let Some(ref dlg) = self.state.confirm_dialog {
             if let Some(ref cancel_id) = dlg.cancel_id {
@@ -1260,7 +1533,7 @@ impl YtmTidalApp {
     }
 }
 
-fn upscale_artwork_url(url: &str) -> String {
+pub fn upscale_artwork_url(url: &str) -> String {
     if url.contains("lh3.googleusercontent.com")
         || url.contains("yt3.ggpht.com")
         || url.contains("yt3.googleusercontent.com")
@@ -1278,6 +1551,22 @@ fn upscale_artwork_url(url: &str) -> String {
 fn urls_match_loosely(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.trim_end_matches('/').to_lowercase();
     norm(a) == norm(b)
+}
+
+fn is_watch_url(url: &str) -> bool {
+    let trimmed = url.trim().to_lowercase();
+    let path = if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    {
+        match rest.find('/') {
+            Some(i) => &rest[i + 1..],
+            None => "",
+        }
+    } else {
+        trimmed.trim_start_matches('/')
+    };
+    path == "watch" || path.starts_with("watch?") || path.starts_with("watch/")
 }
 
 impl Focusable for YtmTidalApp {
@@ -1305,8 +1594,13 @@ impl Render for YtmTidalApp {
         }
 
         let show_drawer = self.drawer_tab.is_some();
+        let show_video_pip = self.video_pip
+            && !show_drawer
+            && !self.video_fullscreen
+            && self.state.player.playback_mode == PlaybackMode::Video;
         let overlay = overlays::render_overlays(self, window, cx);
         let active_view = self.active_view;
+        self.sync_embedded_video_rect(true);
 
         div()
             .relative()
@@ -1352,15 +1646,21 @@ impl Render for YtmTidalApp {
                             .min_w_0()
                             .h_full()
                             .child(topbar::render_topbar(self, cx))
-                            .child(match active_view {
-                                ActiveView::Webapp => {
-                                    content::render_content(self, window, cx).into_any_element()
-                                }
-                                ActiveView::Feed => {
-                                    feed_view::render_feed_view(self, window, cx).into_any_element()
-                                }
-                                ActiveView::Settings => {
-                                    settings_view::render_settings_view(self, cx).into_any_element()
+                            .child(if show_drawer {
+                                drawer::render_now_playing_stage(self, window, cx).into_any_element()
+                            } else {
+                                match active_view {
+                                    ActiveView::Webapp => {
+                                        content::render_content(self, window, cx).into_any_element()
+                                    }
+                                    ActiveView::Feed => {
+                                        feed_view::render_feed_view(self, window, cx)
+                                            .into_any_element()
+                                    }
+                                    ActiveView::Settings => {
+                                        settings_view::render_settings_view(self, cx)
+                                            .into_any_element()
+                                    }
                                 }
                             }),
                     )
@@ -1368,7 +1668,28 @@ impl Render for YtmTidalApp {
             )
             // Persistent Bottom TIDAL-style Player Bar
             .child(player_bar::render_player_bar(self, window, cx))
+            // Floating bottom-right Picture-in-Picture (Miniplayer) 16:9 video slot
+            .when(show_video_pip, |el| {
+                el.child(drawer::render_video_pip_slot(self))
+            })
             // Floating overlays (Confirm Dialog, New Playlist Modal, Context Menu, Save to Playlist)
             .when_some(overlay, |el, modal| el.child(modal))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_watch_urls_without_false_positives() {
+        assert!(is_watch_url("https://music.youtube.com/watch?v=abc123&list=PL1"));
+        assert!(is_watch_url("https://music.youtube.com/watch"));
+        assert!(is_watch_url("/watch?v=abc123"));
+        assert!(is_watch_url("watch?v=abc123"));
+        assert!(!is_watch_url("https://music.youtube.com/"));
+        assert!(!is_watch_url("https://music.youtube.com/playlist?list=PL1"));
+        assert!(!is_watch_url("https://music.youtube.com/browse/MPREb_123"));
+        assert!(!is_watch_url("https://music.youtube.com/search?q=watch+tower"));
     }
 }

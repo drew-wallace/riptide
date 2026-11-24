@@ -165,11 +165,10 @@ pub fn render_topbar(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) -> impl I
                             "Show WebView"
                         }),
                 )
-                // Account / Sign In button
+                // Account identity badge (non-clickable when signed in; Sign In button when signed out)
                 .child(if is_signed_in {
                     div()
                         .id("account-pill")
-                        .cursor_pointer()
                         .flex()
                         .items_center()
                         .gap_2()
@@ -180,19 +179,11 @@ pub fn render_topbar(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) -> impl I
                         .bg(TidalTheme::bg_surface())
                         .border_1()
                         .border_color(TidalTheme::border_default())
-                        .hover(|s| s.bg(TidalTheme::bg_surface_hover()))
-                        .tooltip(tidal_tooltip(
-                            "Signed in to YouTube Music (click to inspect account in WebView)",
-                            None,
-                        ))
-                        .on_click(cx.listener(|this, _, _, _| {
-                            this.controller.send(WebCommand::ToggleWebViewVisible);
-                        }))
+                        .flex_shrink_0()
                         .child(artwork_box(avatar_url.as_deref(), px(26.0), true))
                         .child(
                             div()
-                                .max_w(px(110.0))
-                                .truncate()
+                                .whitespace_nowrap()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(TidalTheme::text_primary())

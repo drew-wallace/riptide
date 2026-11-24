@@ -178,9 +178,33 @@ pub fn render_content(
         )
 }
 
-fn action_icon(label: &str) -> &'static str {
+fn action_icon_el(label: &str) -> gpui::AnyElement {
     let lower = label.to_lowercase();
-    if lower.contains("shuffle") {
+    if lower.contains("share") {
+        // Crisp monochrome upward-arrow-out-of-tray Share icon (matching TIDAL's header)
+        return div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .w(px(16.0))
+            .h(px(16.0))
+            .child(div().text_xs().line_height(px(10.0)).child("↑"))
+            .child(
+                div()
+                    .w(px(11.0))
+                    .h(px(4.5))
+                    .mt(px(-1.0))
+                    .rounded_b(px(2.0))
+                    .border_1()
+                    .border_t_0()
+                    .border_color(TidalTheme::text_primary()),
+            )
+            .into_any_element();
+    }
+    let glyph = if lower.contains("edit") {
+        "✎"
+    } else if lower.contains("shuffle") {
         "⇄"
     } else if lower.contains("radio") || lower.contains("mix") {
         "◎"
@@ -192,14 +216,17 @@ fn action_icon(label: &str) -> &'static str {
         "+"
     } else {
         "•"
-    }
+    };
+    div().text_base().child(glyph).into_any_element()
 }
 
 fn render_detail_hero(header: PageHeader, cx: &mut Context<YtmTidalApp>) -> impl IntoElement {
-    let actions = header.actions;
+    let actions: Vec<_> = header
+        .actions
+        .into_iter()
+        .filter(|a| !a.label.to_lowercase().contains("thumbnail"))
+        .collect();
     let artwork_url_for_zoom = header.artwork_url.clone();
-    let title_for_zoom = header.title.clone();
-    let subtitle_for_zoom = header.subtitle.clone();
     let is_circular = header.is_circular;
 
     let hero_artwork = if let Some(zoom_url) = artwork_url_for_zoom {
@@ -212,13 +239,7 @@ fn render_detail_hero(header: PageHeader, cx: &mut Context<YtmTidalApp>) -> impl
             .hover(|s| s.border_color(TidalTheme::accent()))
             .tooltip(tidal_tooltip("View full artwork", None))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_artwork_lightbox(
-                    zoom_url.clone(),
-                    title_for_zoom.clone(),
-                    subtitle_for_zoom.clone(),
-                    is_circular,
-                    cx,
-                );
+                this.open_artwork_lightbox(zoom_url.clone(), is_circular, cx);
             }))
             .child(artwork_box(
                 header.artwork_url.as_deref(),
@@ -309,7 +330,7 @@ fn render_detail_hero(header: PageHeader, cx: &mut Context<YtmTidalApp>) -> impl
                                             this.controller
                                                 .send(WebCommand::ClickItem(act_id.clone()));
                                         }))
-                                        .child(div().text_base().child(action_icon(&act.label)))
+                                        .child(action_icon_el(&act.label))
                                         .child(act.label)
                                         .into_any_element(),
                                     HeaderActionKind::Secondary => div()
@@ -335,7 +356,7 @@ fn render_detail_hero(header: PageHeader, cx: &mut Context<YtmTidalApp>) -> impl
                                             this.controller
                                                 .send(WebCommand::ClickItem(act_id.clone()));
                                         }))
-                                        .child(div().text_base().child(action_icon(&act.label)))
+                                        .child(action_icon_el(&act.label))
                                         .child(act.label)
                                         .into_any_element(),
                                     HeaderActionKind::Toggle => div()
@@ -373,7 +394,7 @@ fn render_detail_hero(header: PageHeader, cx: &mut Context<YtmTidalApp>) -> impl
                                             this.controller
                                                 .send(WebCommand::ClickItem(act_id.clone()));
                                         }))
-                                        .child(div().text_base().child(action_icon(&act.label)))
+                                        .child(action_icon_el(&act.label))
                                         .child(act.label)
                                         .into_any_element(),
                                     HeaderActionKind::Menu => div()

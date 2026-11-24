@@ -35,7 +35,7 @@ pub fn render_overlays(
         return Some(render_confirm_dialog(dlg.clone(), cx).into_any_element());
     }
 
-    if app.show_new_playlist_modal {
+    if app.show_new_playlist_modal || app.editing_playlist_form {
         return Some(render_new_playlist_modal(app, cx).into_any_element());
     }
 
@@ -62,11 +62,11 @@ fn render_artwork_lightbox(
     let vp = window.viewport_size();
     let vp_w: f32 = vp.width.into();
     let vp_h: f32 = vp.height.into();
-    let img_size = (vp_h - 200.0).min(vp_w - 140.0).clamp(260.0, 560.0);
+    let img_size = (vp_h - 120.0).min(vp_w - 160.0).clamp(280.0, 620.0);
     let radius = if lb.is_circular {
         px(img_size / 2.0)
     } else {
-        px(12.0)
+        px(10.0)
     };
 
     div()
@@ -74,10 +74,8 @@ fn render_artwork_lightbox(
         .absolute()
         .inset_0()
         .flex()
-        .flex_col()
         .items_center()
         .justify_center()
-        .gap_4()
         .bg(TidalTheme::overlay_dark())
         .on_mouse_down(
             MouseButton::Left,
@@ -85,83 +83,21 @@ fn render_artwork_lightbox(
                 this.close_artwork_lightbox(cx);
             }),
         )
+        // Bare floating artwork (no card, no title, no padding) with X button floating outside top-right
         .child(
             div()
-                .id("artwork-lightbox-card")
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_3p5()
-                .p_5()
-                .rounded(px(16.0))
-                .bg(TidalTheme::bg_surface())
-                .border_1()
-                .border_color(TidalTheme::border_strong())
-                .shadow_lg()
+                .id("artwork-lightbox-frame")
+                .relative()
+                .w(px(img_size))
+                .h(px(img_size))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .w(px(img_size))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .min_w_0()
-                                .flex_1()
-                                .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(TidalTheme::text_primary())
-                                        .truncate()
-                                        .child(lb.title),
-                                )
-                                .when(!lb.subtitle.is_empty(), |el| {
-                                    el.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(TidalTheme::text_secondary())
-                                            .truncate()
-                                            .child(lb.subtitle),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .id("artwork-lightbox-close")
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(32.0))
-                                .h(px(32.0))
-                                .rounded_full()
-                                .bg(TidalTheme::bg_surface_active())
-                                .hover(|s| {
-                                    s.bg(TidalTheme::bg_surface_hover())
-                                        .text_color(TidalTheme::accent())
-                                })
-                                .text_sm()
-                                .text_color(TidalTheme::text_secondary())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_artwork_lightbox(cx);
-                                }))
-                                .child("✕"),
-                        ),
-                )
                 .child(
                     div()
                         .w(px(img_size))
                         .h(px(img_size))
                         .rounded(radius)
                         .overflow_hidden()
-                        .bg(TidalTheme::bg_void())
-                        .border_1()
-                        .border_color(TidalTheme::border_subtle())
+                        .shadow_lg()
                         .child(
                             img(SharedUri::from(lb.url))
                                 .w(px(img_size))
@@ -169,6 +105,36 @@ fn render_artwork_lightbox(
                                 .rounded(radius)
                                 .object_fit(gpui::ObjectFit::Cover),
                         ),
+                )
+                .child(
+                    div()
+                        .id("artwork-lightbox-close")
+                        .absolute()
+                        .top(px(0.0))
+                        .right(px(-46.0))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(36.0))
+                        .h(px(36.0))
+                        .rounded_full()
+                        .bg(TidalTheme::bg_surface())
+                        .border_1()
+                        .border_color(TidalTheme::border_strong())
+                        .shadow_md()
+                        .hover(|s| {
+                            s.bg(TidalTheme::bg_surface_hover())
+                                .border_color(TidalTheme::accent())
+                                .text_color(TidalTheme::accent())
+                        })
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(TidalTheme::text_primary())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_artwork_lightbox(cx);
+                        }))
+                        .child("✕"),
                 ),
         )
 }
@@ -603,6 +569,26 @@ fn render_confirm_dialog(
 fn render_new_playlist_modal(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) -> impl IntoElement {
     let privacy = app.new_playlist_privacy;
     let can_submit = !app.new_playlist_title.read(cx).text().trim().is_empty();
+    let heading = if app.editing_playlist_form {
+        app.state
+            .playlist_form
+            .as_ref()
+            .map(|f| f.heading.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "Edit Playlist".to_string())
+    } else {
+        "New Playlist".to_string()
+    };
+    let submit_label = if app.editing_playlist_form {
+        app.state
+            .playlist_form
+            .as_ref()
+            .map(|f| f.submit_label.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Save".to_string())
+    } else {
+        "Create".to_string()
+    };
 
     div()
         .id("new-playlist-backdrop")
@@ -643,7 +629,7 @@ fn render_new_playlist_modal(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) -
                                 .text_lg()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(TidalTheme::text_primary())
-                                .child("New Playlist"),
+                                .child(heading),
                         )
                         .child(
                             div()
@@ -793,7 +779,7 @@ fn render_new_playlist_modal(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) -
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.submit_new_playlist(cx);
                                 }))
-                                .child("Create"),
+                                .child(submit_label),
                         ),
                 ),
         )

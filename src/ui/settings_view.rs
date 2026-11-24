@@ -463,55 +463,25 @@ pub fn render_settings_view(app: &YtmTidalApp, cx: &mut Context<YtmTidalApp>) ->
                                         .child("Session cookies and settings are stored locally under %LOCALAPPDATA%\\riptide."),
                                 ),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("settings-toggle-webview")
-                                        .cursor_pointer()
-                                        .px_3p5()
-                                        .py_1p5()
-                                        .rounded(px(8.0))
-                                        .bg(TidalTheme::bg_surface_active())
-                                        .border_1()
-                                        .border_color(TidalTheme::border_default())
-                                        .hover(|s| s.border_color(TidalTheme::accent()))
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(TidalTheme::text_primary())
-                                        .on_click(cx.listener(|this, _, _, _| {
-                                            this.controller
-                                                .send(WebCommand::ToggleWebViewVisible);
-                                        }))
-                                        .child(if app.webview_visible {
-                                            "Hide WebView"
-                                        } else {
-                                            "Show WebView"
-                                        }),
-                                )
-                                .when(!is_signed_in, |row| {
-                                    row.child(
-                                        div()
-                                            .id("settings-signin")
-                                            .cursor_pointer()
-                                            .px_4()
-                                            .py_1p5()
-                                            .rounded(px(8.0))
-                                            .bg(TidalTheme::text_primary())
-                                            .hover(|s| s.bg(TidalTheme::accent()))
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(TidalTheme::text_inverse())
-                                            .on_click(cx.listener(|this, _, _, _| {
-                                                this.controller.send(WebCommand::OpenSignIn);
-                                            }))
-                                            .child("Sign In"),
-                                    )
-                                }),
-                        ),
+                        .when(!is_signed_in, |row| {
+                            row.child(
+                                div()
+                                    .id("settings-signin")
+                                    .cursor_pointer()
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded(px(8.0))
+                                    .bg(TidalTheme::text_primary())
+                                    .hover(|s| s.bg(TidalTheme::accent()))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(TidalTheme::text_inverse())
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.controller.send(WebCommand::OpenSignIn);
+                                    }))
+                                    .child("Sign In"),
+                            )
+                        }),
                 ),
         ),
         )

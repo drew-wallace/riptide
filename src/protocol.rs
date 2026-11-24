@@ -186,6 +186,14 @@ pub enum RepeatMode {
     One,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackMode {
+    #[default]
+    Song,
+    Video,
+}
+
 /// A text span that optionally links to an Artist, Album, or Playlist inside YouTube Music.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -219,6 +227,8 @@ pub struct PlayerState {
     pub like_status: LikeStatus,
     pub repeat_mode: RepeatMode,
     pub is_shuffled: bool,
+    pub playback_mode: PlaybackMode,
+    pub can_toggle_video: bool,
 }
 
 impl PlayerState {
@@ -307,6 +317,56 @@ pub struct ShareDialog {
     pub close_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PlaylistFormDialog {
+    pub heading: String,
+    pub title: String,
+    pub description: String,
+    pub privacy: String,
+    pub submit_label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEmbedMode {
+    Normal,
+    Pip,
+    Fullscreen,
+}
+
+impl VideoEmbedMode {
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            VideoEmbedMode::Normal => "normal",
+            VideoEmbedMode::Pip => "pip",
+            VideoEmbedMode::Fullscreen => "fullscreen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoViewport {
+    pub rect: VideoRect,
+    pub mode: VideoEmbedMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoUiAction {
+    EnterPip,
+    ExitPipToNormal,
+    ClosePip,
+    ToggleFullscreen,
+    ExitFullscreen,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShelfKind {
@@ -362,6 +422,7 @@ pub struct SidebarPlaylist {
 #[serde(default)]
 pub struct QueueItem {
     pub id: String,
+    pub menu_id: Option<String>,
     pub title: String,
     pub artist: String,
     pub artist_links: Vec<TextLink>,
@@ -407,6 +468,7 @@ pub struct LyricsState {
 #[serde(default)]
 pub struct BridgeState {
     pub connected: bool,
+    pub bridge_session_id: String,
     pub url: String,
     pub page_title: String,
     pub route: Route,
@@ -420,6 +482,7 @@ pub struct BridgeState {
     pub empty_state: Option<EmptyPageState>,
     pub confirm_dialog: Option<ConfirmDialog>,
     pub share_dialog: Option<ShareDialog>,
+    pub playlist_form: Option<PlaylistFormDialog>,
     pub account: AccountState,
     pub player: PlayerState,
     pub chips: Vec<FilterChip>,
@@ -445,6 +508,7 @@ pub enum WebCommand {
     ToggleDislike,
     ToggleShuffle,
     CycleRepeat,
+    SetPlaybackMode(PlaybackMode),
     NavigateRoute(Route),
     NavigateUrl(String),
     PlayRelease {
@@ -467,14 +531,25 @@ pub enum WebCommand {
         description: String,
         privacy: String,
     },
+    SavePlaylistForm {
+        title: String,
+        description: String,
+        privacy: String,
+    },
+    SyncVideoViewport(Option<VideoViewport>),
     GoBack,
     GoForward,
     Refresh,
     ScrollMore,
     RequestQueue,
+    PlayQueueItem(usize),
+    MoveQueueItem {
+        from: usize,
+        to: usize,
+    },
     RequestLyrics,
     RequestRelated,
-    ClosePlayerPage,
+    ClosePlayerPage(Option<String>),
     RefreshFeed(FeedArtistSource),
     #[doc(hidden)]
     CollectorIpc(String),
@@ -496,6 +571,7 @@ pub enum WebEvent {
     StateSync(Box<BridgeState>),
     FeedUpdate(FeedCollectorPayload),
     WebViewVisibilityChanged(bool),
+    VideoAction(VideoUiAction),
     StatusMessage(String),
 }
 

@@ -103,6 +103,15 @@ impl SearchInput {
         self.content.as_ref()
     }
 
+    pub fn set_text(&mut self, value: &str, cx: &mut Context<Self>) {
+        let len = value.len();
+        self.content = value.to_string().into();
+        self.selected_range = len..len;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();
         self.selected_range = 0..0;
