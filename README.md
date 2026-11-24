@@ -2,6 +2,17 @@
 
 A native Rust desktop client for YouTube Music built with **GPUI** (from Zed) and styled after **TIDAL**'s dark, audiophile-grade monochrome UI.
 
+## Screenshots
+
+### Now Playing & Up Next
+![Riptide Playback and Up Next](screenshots/playback.png)
+
+### Personalized Release Feed
+![Riptide Release Feed](screenshots/feed.png)
+
+### Settings & Feed Schedule
+![Riptide Settings](screenshots/settings.png)
+
 ## UI & UX Differences from YouTube Music
 
 Riptide reimagines the YouTube Music web experience as a distraction-free, TIDAL-inspired native desktop app:
