@@ -2,6 +2,18 @@
 
 A native Rust desktop client for YouTube Music built with **GPUI** (from Zed) and styled after **TIDAL**'s dark, audiophile-grade monochrome UI.
 
+## UI & UX Differences from YouTube Music
+
+Riptide reimagines the YouTube Music web experience as a distraction-free, TIDAL-inspired native desktop app:
+
+- **TIDAL-Styled Native Interface**: Replaces YouTube Music's browser UI with hardware-accelerated obsidian monochrome surfaces, hairline borders, electric cyan (`#00FFFF`) accents, larger monochrome iconography, and a custom OS taskbar/titlebar icon.
+- **Personalized Release Feed *(New Feature)***: Adds a TIDAL-style **Feed** tab below **Home** that YouTube Music lacks—tracking new albums, EPs, and singles from your **Subscribed**, **Collection**, or **Both** artists, grouped into Sunday-start calendar buckets (**This week**, **Last week**, **This month**, **Last month**, **Older**) with **All / Albums / Singles & EPs** filters. Includes an unread badge that clears automatically when you visit Feed, on-hover **▶** play buttons on artwork, a far-right `⋯` action menu, and configurable automatic refresh schedules (**On app open**, **Once daily** at a chosen time, and **Run immediately if missed**).
+- **Cleaner Browsing & Tracklists**: Strips out visual clutter such as redundant page eyebrows and "Featured other playlists" shelves inside playlist views, omits empty artwork placeholders on album tracklists (showing track numbers with hover play glyphs and switching the metadata column to `PLAYS` when appropriate), and auto-hydrates long playlists so suggested tracks load without manual scrolling.
+- **Consistent Click & Link Behavior**: Clicking a row for an album/playlist opens its detail page while clicking the artwork's hover play button starts playback; clickable artist and album links across the player bar, track rows, headers, and queue underline on hover.
+- **Native Desktop Navigation & Smooth Scrolling**: Maintains a unified Back/Forward history stack across YouTube Music pages, Feed, and Settings—with **mouse side Back/Forward button** support, automatic scroll-to-top on new pages, and exact scroll-position restoration when stepping through history. All scrollable panes use VSync-locked smooth scrolling paired with viewport virtualization for large feeds and long playlists.
+- **Upgraded Player Bar**: Features a full-width top-edge TIDAL progress scrubber with click-and-drag seeking and a live **hover timestamp preview** pill, a drag-scrubbing volume slider with a live percentage tooltip, hover tooltips with shortcut badges on controls, and **persisted volume & mute state** across restarts so YouTube Music doesn't reset your volume to 100%.
+- **Non-Intrusive Side Drawer & Native Modals**: Combines **Up Next**, **Lyrics**, and **Related** in a collapsible right-hand drawer without taking over the main stage, and replaces interrupting webapp popups with native GPUI dialogs for **New Playlist**, **Unsubscribe/Confirmation**, **Save to Playlist**, **Share** (one-click clipboard copy + external share targets), and a high-res (`1200×1200`) **Artwork Lightbox** when clicking hero cover art.
+
 ## How It Works (ToS-Friendly Architecture)
 
 Instead of reverse-engineering private YouTube APIs, extracting audio stream URLs, or spoofing client headers, **Riptide** runs the genuine `https://music.youtube.com` web application inside a persistent embedded **Microsoft Edge WebView2** browser session (`wry` + `tao`) on a dedicated background UI thread:
