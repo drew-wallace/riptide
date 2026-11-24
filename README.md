@@ -11,6 +11,23 @@ Instead of reverse-engineering private YouTube APIs, extracting audio stream URL
 - **Persistent Google Sign-In**: Cookies and session data are stored locally in `%LOCALAPPDATA%\riptide\webview2`. Click **Sign In** or **Show WebView** (or press `Ctrl+Shift+W`) at any time to reveal the real WebView2 window for standard Google authentication, 2FA, or inspecting the live webapp; closing the WebView window simply hides it again without interrupting playback.
 - **Native Artwork Loading (`src/http_image_client.rs`)**: Registers a `reqwest`-backed `gpui::http_client::HttpClient` so GPUI's `img()` element fetches, decodes, and GPU-caches upscaled album artwork natively.
 
+## Network & API Transparency (ToS-Friendly by Design)
+
+Riptide is designed to avoid reverse-engineering or abusing YouTube Music's private APIs:
+
+- **No private Innertube API calls**: Neither the Rust binary nor the bridge scripts call `youtubei/v1/*`, extract raw audio stream URLs, spoof client headers, or bypass playback/auth flows. All YouTube Music API traffic and audio streaming are performed directly by Google's genuine webapp inside Microsoft Edge WebView2.
+- **No telemetry or third-party backend**: There is no analytics, crash reporting, or external server—your session, settings, and caches stay strictly on your machine under `%LOCALAPPDATA%\riptide`.
+
+### Complete Outbound Request Audit
+
+| Destination | Mechanism | Auth / Cookies | Purpose & Pacing |
+|---|---|---|---|
+| `https://music.youtube.com/*` | Embedded WebView2 (`src/webview.rs`, `src/bridge.js`) | Your normal WebView2 Google session | All browsing, search, playback, likes, playlists, queue, lyrics, related tracks, and Feed artist discovery—driven via DOM clicks and `yt-navigate` on the real webapp. |
+| `https://api.deezer.com/search/artist` & `/artist/{id}/albums` | Rust `reqwest` (`src/deezer.rs`) | None (unauthenticated public API) | Primary release-date and catalog lookup for the personalized **Feed**. Artist ID mappings are cached locally (`deezer_artist_map.json`), and requests are paced at ≥135 ms (~7.4 req/s) with automatic exponential backoff. |
+| Artwork CDNs (`lh3.googleusercontent.com`, `yt3.ggpht.com`, `cdn-images.dzcdn.net`, etc.) | Rust `reqwest` (`src/http_image_client.rs`) | None (no cookies) | Cookie-free `GET` requests for album covers and artist portraits currently rendered in the UI (virtualized lists only fetch visible items). |
+| `https://www.youtube.com/watch?v={id}` *(fallback only)* | Hidden muted WebView2 (`src/feed_collector.js`) | Shared WebView2 session | Only runs for artists not confidently matched on Deezer whose release date isn't already cached in `feed_cache.json`, reading `"Released on: YYYY-MM-DD"` from the standard watch page (spaced ≥110 ms apart). |
+| External Share targets (YouTube, Deezer, X, Reddit, etc.) | OS default browser (`cx.open_url`) | Handled by your browser | Triggered strictly when you explicitly click a target inside the Share modal. |
+
 ## Running
 
 Prerequisites on Windows:
