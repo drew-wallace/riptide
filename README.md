@@ -1,4 +1,4 @@
-# Riptide — Native GPUI YouTube Music Client
+# Riptide — A Native ToS friendly YouTube Music Client
 
 A native Rust desktop client for YouTube Music built with **GPUI** (from Zed) and styled after **TIDAL**'s dark, audiophile-grade monochrome UI.
 
