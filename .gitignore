@@ -1,0 +1,25 @@
+# Rust / Cargo build outputs
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.res
+
+# Generated icon artifact (regenerated automatically by build.rs)
+/assets/app_icon.ico
+
+# Logs & local environment files
+*.log
+.env
+.env.*
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
